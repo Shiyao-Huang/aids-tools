@@ -498,6 +498,49 @@ def remove_pending(event: Dict[str, Any]) -> None:
         pass
 
 
+
+
+def gitnexus_enabled() -> bool:
+    return env_first("AIDS_GITNEXUS", "AID_GITNEXUS", "SELFTOOLS_GITNEXUS") != "0"
+
+
+def run_gitnexus(args: List[str], cwd: str, timeout: int = 8) -> Optional[subprocess.CompletedProcess]:
+    if not gitnexus_enabled():
+        return None
+    gn = shutil.which("gitnexus")
+    if not gn:
+        return None
+    try:
+        return subprocess.run(
+            [gn, *args], cwd=cwd, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, check=False,
+        )
+    except Exception:
+        return None
+
+
+def gitnexus_file_context(file_path: str, cwd: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not gitnexus_enabled():
+        return None
+    work_dir = cwd or os.getcwd()
+    try:
+        rel = os.path.relpath(file_path, work_dir)
+    except Exception:
+        rel = file_path
+    ctx: Dict[str, Any] = {"enabled": True, "path": rel, "available": False, "importance": "unknown", "summary": ""}
+    proc = run_gitnexus(["query", rel], work_dir, timeout=8)
+    if not proc:
+        ctx["summary"] = "GitNexus unavailable or repo not indexed."
+        return ctx
+    output = (proc.stdout or proc.stderr or "").strip()
+    ctx["available"] = True
+    ctx["summary"] = output[:1200]
+    lowered = output.lower()
+    hits = sum(tok in lowered for tok in ["critical", "route", "api", "handler", "caller", "impact", "process"])
+    ctx["importance"] = "high" if hits >= 3 else ("medium" if hits >= 1 else "low")
+    return ctx
+
 def format_recent_context(resources: List[str], session: Dict[str, Any], limit: int = RECENT_LIMIT) -> str:
     lines: List[str] = []
     for res in resources:
@@ -593,6 +636,16 @@ def cmd_hook_pre_tool_use(_: argparse.Namespace) -> int:
         save_pending(event, session, resources)
     if tool_name in WRITE_TOOL_NAMES and resources:
         context = format_recent_context(resources, session)
+        # GitNexus code-graph awareness
+        gn_lines = []
+        for res in resources:
+            if not res.startswith(("bash:", "mcp:")):
+                gn = gitnexus_file_context(res, cwd)
+                if gn and gn.get("available"):
+                    gn_lines.append(f"- GitNexus importance: {gn['importance']}")
+                    gn_lines.append(f"- GitNexus context: {short(gn['summary'], 300)}")
+        if gn_lines:
+            context += "\n" + "\n".join(gn_lines)
         message = f"写前必读 / AIDS awareness for {tool_name}:\n{context}"
         hook_output("PreToolUse", message)
     return 0

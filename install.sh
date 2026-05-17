@@ -57,6 +57,8 @@ Options:
   --no-claude            Skip ~/.claude hook registration
   --no-codex             Skip ~/.codex hook registration
   --no-mcp               Skip MCP wrapper registration
+  --with-gitnexus        Enable GitNexus code-graph awareness (default: auto-detect)
+  --without-gitnexus     Disable GitNexus integration
   -h, --help             Show this help
 
 Environment overrides:
@@ -81,6 +83,8 @@ while [ $# -gt 0 ]; do
     --no-claude) DO_CLAUDE=0 ;;
     --no-codex) DO_CODEX=0 ;;
     --no-mcp) DO_MCP=0 ;;
+    --with-gitnexus) WITH_GITNEXUS=1 ;;
+    --without-gitnexus) WITH_GITNEXUS=0 ;;
     -h|--help) usage; exit 0 ;;
     *) error "Unknown option: $1" ;;
   esac
@@ -213,7 +217,8 @@ install_payload() {
 }
 
 install_bins() {
-  info "Installing CLI shims into $BIN_DIR"
+  ensure_gitnexus
+info "Installing CLI shims into $BIN_DIR"
   run mkdir -p "$BIN_DIR"
   run ln -sf "$INSTALL_DIR/bin/selftools" "$BIN_DIR/selftools"
   run ln -sf "$INSTALL_DIR/bin/selftools" "$BIN_DIR/aids"
@@ -370,7 +375,7 @@ configure_codex_mcp() {
     printf '[DRY-RUN] add [mcp_servers.aids] to %q\n' "$config"
     return
   fi
-CODEX_CONFIG="$config" SELFTOOLS_MCP="$mcp" AIDS_DATA_DIR="$DATA_DIR" AIDS_HOME="$DATA_DIR" AID_DATA_DIR="$DATA_DIR" AID_HOME="$DATA_DIR" SELFTOOLS_DATA_DIR="$DATA_DIR" python3 <<'PY'
+CODEX_CONFIG="$config" SELFTOOLS_MCP="$mcp" AIDS_DATA_DIR="$DATA_DIR" AIDS_GITNEXUS="${WITH_GITNEXUS:-}" AIDS_HOME="$DATA_DIR" AID_DATA_DIR="$DATA_DIR" AID_HOME="$DATA_DIR" SELFTOOLS_DATA_DIR="$DATA_DIR" python3 <<'PY'
 import os, re
 from pathlib import Path
 config = Path(os.environ["CODEX_CONFIG"])
