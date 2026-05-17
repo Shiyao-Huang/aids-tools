@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AIDS (Agent-ID System) — one-line installer
 # Usage:
-#   curl -sfL https://raw.githubusercontent.com/<org>/aids-tools/main/install.sh | bash
+#   curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
 #   ./install.sh --source .
 #   ./install.sh --uninstall
 set -euo pipefail

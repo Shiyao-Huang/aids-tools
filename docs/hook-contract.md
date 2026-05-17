@@ -906,7 +906,7 @@ aids-tools/
 The one-line install remains mandatory:
 
 ```bash
-curl -sfL https://raw.githubusercontent.com/<org>/aids-tools/main/install.sh | bash
+curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
 ```
 
 Installer requirements:

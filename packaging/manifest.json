@@ -1,11 +1,11 @@
 {
   "name": "aids",
-  "displayName": "AIDS / Agent-ID System / 意识工具",
+  "displayName": "AIDS / Agent-ID System",
   "version": "0.1.0",
   "description": "AIDS (Agent-ID System): identity-aware hook, Bash, and wrapper layer for Claude Code and Codex with shared timeline, session registry, read-before-write awareness, trace chain, ratings, and MCP query tools.",
   "install": {
     "entrypoint": "install.sh",
-    "oneLinePattern": "curl -sfL https://raw.githubusercontent.com/<org>/aids-tools/main/install.sh | bash",
+    "oneLinePattern": "curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash",
     "dataDirDefault": "~/.aids",
     "installDirDefault": "~/.aids/selftools",
     "binDirDefault": "~/.local/bin"

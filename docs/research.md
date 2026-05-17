@@ -97,7 +97,7 @@ TOML
 Use this as the base installer skeleton:
 
 ```bash
-curl -sfL https://raw.githubusercontent.com/<org>/aids-tools/main/install.sh | bash
+curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
 ```
 
 Installer responsibilities:
@@ -612,7 +612,7 @@ This directly implements the cabinet metaphor: when an agent opens a file, `PreT
 ### Installer
 
 ```bash
-curl -sfL https://raw.githubusercontent.com/<org>/aids-tools/main/install.sh | bash
+curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
 ```
 
 Installer phases:

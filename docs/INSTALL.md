@@ -6,7 +6,7 @@
 
 ```sh
 # Placeholder org/repo until publish.
-curl -sfL https://raw.githubusercontent.com/<org>/aids-tools/main/install.sh | bash
+curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
 ```
 
 The installer:
@@ -34,7 +34,7 @@ The user explicitly cited these as the shape to mirror:
 When the curl-pipe path is unsuitable (air-gapped, audit-required, suspicious of `| bash`), the installer must support:
 
 ```sh
-git clone https://github.com/<org>/aids-tools
+git clone https://github.com/Shiyao-Huang/aids-tools
 cd aids-tools
 ./install.sh
 ```

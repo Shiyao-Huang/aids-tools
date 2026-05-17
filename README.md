@@ -79,7 +79,7 @@ aids rate trace_003 bad "不该在生产配置里用 test 密码"
 一句话搞定：
 
 ```bash
-curl -sfL https://raw.githubusercontent.com/<org>/aids-tools/main/install.sh | bash
+curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
 ```
 
 装完之后，Claude Code、Codex、Bash 三层全覆盖。所有操作自动进同一条 timeline。
