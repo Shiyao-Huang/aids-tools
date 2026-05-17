@@ -341,7 +341,7 @@ function normalizeTrace(input = {}) {
   const operation = canonicalOperation(source.operation || source.tool || source.toolName);
   const cwd = source.cwd || (source.metadata && source.metadata.cwd) || process.cwd();
   const filePath = normalizeFilePath(source.filePath || source.targetPath || source.target_path || source.resource_path || source.resourcePath || '', cwd);
-  const purpose = source.purpose || source.intent || '';
+  const purpose = (source.purpose && source.purpose !== 'unspecified' ? source.purpose : null) || (source.intent && source.intent !== 'unspecified' ? source.intent : null) || envFirst('AIDS_INTENT', 'AHA_SESSION_NAME', 'AHA_TASK_TITLE') || '';
   const sessionId =
     source.sessionId ||
     source.session_id ||
@@ -364,7 +364,7 @@ function normalizeTrace(input = {}) {
       source.display_name ||
       envFirst('AIDS_AGENT_NAME', 'AID_AGENT_NAME', 'AGENT_NAME', 'SELFTOOLS_DISPLAY_NAME', 'ZHUYI_DISPLAY_NAME', 'AIDS_ROLE', 'AID_ROLE', 'ROLE', 'SELFTOOLS_ROLE', 'ZHUYI_ROLE') ||
       'unknown',
-    role: source.role || envFirst('AIDS_ROLE', 'AID_ROLE', 'ROLE', 'SELFTOOLS_ROLE', 'ZHUYI_ROLE', 'AHA_ROLE') || 'unknown',
+    role: (source.role && source.role !== 'unknown' && source.role !== 'unspecified' ? source.role : null) || envFirst('AIDS_ROLE', 'AID_ROLE', 'ROLE', 'SELFTOOLS_ROLE', 'ZHUYI_ROLE', 'AHA_AGENT_ROLE', 'AHA_ROLE') || 'unknown',
     actor_type,
     actorType: actor_type,
     runtime,
@@ -388,6 +388,7 @@ function normalizeTrace(input = {}) {
   record.intent = record.purpose;
   record.parentOpId = record.prevTraceId;
   record.parent_op_id = record.prevTraceId;
+  record.team_id = source.team_id || source.teamId || envFirst('AIDS_TEAM_ID', 'AHA_ROOM_ID') || null;
   record.timeline_path = timelineFileForDate(datePart(record.timestamp));
   return record;
 }
