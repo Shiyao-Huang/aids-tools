@@ -821,6 +821,8 @@ def cmd_register_session(args: argparse.Namespace) -> int:
         os.environ["AIDS_TEAM_ID"] = args.team_id
     if args.task_id:
         os.environ["AIDS_TASK_ID"] = args.task_id
+    if args.display_name:
+        os.environ["AIDS_DISPLAY_NAME"] = args.display_name
     record = register_session(event, source="cli")
     print(json_dump(record))
     return 0
@@ -847,6 +849,28 @@ def cmd_rate(args: argparse.Namespace) -> int:
     }
     append_jsonl(data_dir() / "ratings" / f"{today()}.jsonl", rating)
     print(json_dump(rating))
+    return 0
+
+
+def cmd_timeline(args: argparse.Namespace) -> int:
+    ensure_layout()
+    tl_file = timeline_file_for_today()
+    if not tl_file.exists():
+        print("No timeline events today.", file=sys.stderr)
+        return 1
+    events = [json.loads(l) for l in tl_file.read_text().strip().splitlines() if l.strip()]
+    events = events[-args.limit:]
+    if args.json:
+        print(json_dump({"count": len(events), "events": events}))
+        return 0
+    for ev in events:
+        ts = ev.get("timestamp_iso", "?")
+        tool = ev.get("tool", "?")
+        sid = str(ev.get("session_id", "?"))[:8]
+        res = str(ev.get("resource", ev.get("resource_path", "")))[:60]
+        runtime = ev.get("runtime", "?")
+        actor = ev.get("actor_type", "?")
+        print(f"{ts[11:19]} {actor}/{runtime} {sid} {tool} {res}")
     return 0
 
 
@@ -896,9 +920,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     reg = sub.add_parser("register-session", help="Register/update a session identity")
     reg.add_argument("--session-id")
-    reg.add_argument("--runtime", choices=["claude", "codex", "unknown"])
+    reg.add_argument("--runtime", choices=["claude", "codex", "bash", "unknown"])
     reg.add_argument("--role")
     reg.add_argument("--goal")
+    reg.add_argument("--display-name")
     reg.add_argument("--team-id")
     reg.add_argument("--task-id")
     reg.add_argument("--model")
@@ -919,7 +944,7 @@ def build_parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("list-sessions", help="List registered sessions")
     ls.add_argument("--status", choices=["active", "retired", "archived"], help="Filter by status")
     ls.add_argument("--role", help="Filter by role")
-    ls.add_argument("--runtime", choices=["claude", "codex", "unknown"], help="Filter by runtime")
+    ls.add_argument("--runtime", choices=["claude", "codex", "bash", "unknown"], help="Filter by runtime")
     ls.add_argument("--json", action="store_true")
     ls.set_defaults(func=cmd_list_sessions)
 
@@ -947,9 +972,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     rate = sub.add_parser("rate", help="Rate a trace operation")
     rate.add_argument("trace_id")
-    rate.add_argument("score", choices=["good", "bad", "uncertain"])
+    rate.add_argument("score", choices=["good", "bad", "neutral", "uncertain"])
     rate.add_argument("comment", nargs="*")
     rate.set_defaults(func=cmd_rate)
+
+
+    tl = sub.add_parser("timeline", help="Show recent timeline events")
+    tl.add_argument("--limit", type=int, default=20)
+    tl.add_argument("--json", action="store_true")
+    tl.set_defaults(func=cmd_timeline)
 
     doctor = sub.add_parser("doctor", help="Verify installation")
     doctor.add_argument("--json", action="store_true")
