@@ -1,0 +1,1019 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aids.local/schemas/tool-envelope.schema.json",
+  "title": "AIDS Canonical ToolEnvelope",
+  "description": "AIDS runtime-neutral envelope for Claude Code, Codex, and Bash operations.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "runtime",
+    "phase",
+    "tool",
+    "session",
+    "intent",
+    "resource",
+    "policy",
+    "timestamps"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "selftools.hook.v1"
+    },
+    "runtime": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "bash",
+        "unknown"
+      ],
+      "description": "Host runtime. bash means a human or shell script entered through the Bash/PATH shim layer."
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "session_start",
+        "pre_tool_use",
+        "post_tool_use"
+      ]
+    },
+    "tool": {
+      "type": "object",
+      "required": [
+        "name",
+        "input"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            "MultiEdit",
+            "NotebookEdit",
+            "apply_patch",
+            "mcp",
+            "unknown"
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "response": {
+          "type": [
+            "object",
+            "string",
+            "null"
+          ]
+        },
+        "use_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "session": {
+      "type": "object",
+      "required": [
+        "id",
+        "role"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "team_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex",
+            "bash",
+            "unknown"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actor_type": {
+          "type": "string",
+          "enum": [
+            "agent",
+            "human",
+            "bash",
+            "system",
+            "unknown"
+          ],
+          "description": "Who/what is acting: agent for Claude/Codex sessions, human for direct shell use, bash for shell-script automation."
+        }
+      },
+      "additionalProperties": true
+    },
+    "intent": {
+      "type": "object",
+      "required": [
+        "value",
+        "source"
+      ],
+      "properties": {
+        "value": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "AIDS_INTENT",
+            "AID_INTENT",
+            "ZHUYI_INTENT",
+            "SELFTOOLS_INTENT",
+            "INTENT",
+            "AHA_TASK",
+            "tool_input",
+            "session_goal",
+            "unspecified"
+          ]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "resource": {
+      "type": "object",
+      "required": [
+        "kind",
+        "key"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "file",
+            "bash",
+            "mcp",
+            "uri",
+            "unknown"
+          ]
+        },
+        "key": {
+          "type": "string",
+          "description": "Normalized stable resource key. File resources use absolute normalized path; Bash uses bash:{sha256-or-command-key}."
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exists_before": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "exists_after": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pre_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "post_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parser": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Which parser produced this resource: file_path, command_hash, apply_patch, mcp_tool, etc."
+        }
+      },
+      "additionalProperties": false
+    },
+    "resources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "key"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "file",
+              "bash",
+              "mcp",
+              "uri",
+              "unknown"
+            ]
+          },
+          "key": {
+            "type": "string",
+            "description": "Normalized stable resource key. File resources use absolute normalized path; Bash uses bash:{sha256-or-command-key}."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exists_before": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "exists_after": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "pre_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "post_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parser": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which parser produced this resource: file_path, command_hash, apply_patch, mcp_tool, etc."
+          }
+        },
+        "additionalProperties": false
+      },
+      "description": "Optional full resource list when one tool call touches multiple resources."
+    },
+    "trace_context": {
+      "type": "object",
+      "properties": {
+        "recent_traces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "trace_id",
+              "session_id",
+              "tool",
+              "resource_path",
+              "operation",
+              "intent",
+              "timestamp"
+            ],
+            "properties": {
+              "trace_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "session_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "tool": {
+                "type": "string"
+              },
+              "resource_path": {
+                "type": "string"
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "create",
+                  "read",
+                  "modify",
+                  "delete",
+                  "execute",
+                  "touch",
+                  "unknown"
+                ]
+              },
+              "intent": {
+                "type": "string"
+              },
+              "pre_hash": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "post_hash": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "duration_ms": {
+                "type": [
+                  "number",
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "timestamp": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "timestamp_iso": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "team_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "metadata": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "ratings_summary": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "last_writer": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "ratings_summary": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "awareness_message": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "policy": {
+      "type": "object",
+      "required": [
+        "mode",
+        "decision",
+        "required_read_before_write"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "observe",
+            "warn",
+            "strict"
+          ]
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "warn",
+            "block",
+            "fail_open"
+          ]
+        },
+        "required_read_before_write": {
+          "type": "boolean"
+        },
+        "block_supported": {
+          "type": "boolean"
+        },
+        "observation_lock": {
+          "type": "object",
+          "required": [
+            "required",
+            "satisfied"
+          ],
+          "properties": {
+            "required": {
+              "type": "boolean"
+            },
+            "satisfied": {
+              "type": "boolean"
+            },
+            "lock_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "read_trace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "read_timestamp": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "expires_at": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "observed_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "current_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "degradation_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "timestamps": {
+      "type": "object",
+      "required": [
+        "received_at"
+      ],
+      "properties": {
+        "received_at": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "started_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "finished_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "native": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "trace_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Trace id assigned or reserved for this operation/timeline event."
+    },
+    "parent_trace_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional parent trace for chains spawned by Bash scripts, apply_patch, or nested tool calls."
+    },
+    "result": {
+      "type": [
+        "object",
+        "string",
+        "null"
+      ],
+      "description": "Normalized result/exit summary. Full native response stays in native/metadata when large.",
+      "additionalProperties": true
+    },
+    "ratings": {
+      "type": "array",
+      "items": {
+        "$ref": "rating-record.schema.json"
+      },
+      "description": "Ratings already attached to this operation when available."
+    },
+    "timeline": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Usually ~/.aids/timeline/YYYY-MM-DD.jsonl."
+        },
+        "event_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_event_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "resource": {
+      "type": "object",
+      "required": [
+        "kind",
+        "key"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "file",
+            "bash",
+            "mcp",
+            "uri",
+            "unknown"
+          ]
+        },
+        "key": {
+          "type": "string",
+          "description": "Normalized stable resource key. File resources use absolute normalized path; Bash uses bash:{sha256-or-command-key}."
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exists_before": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "exists_after": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pre_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "post_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parser": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Which parser produced this resource: file_path, command_hash, apply_patch, mcp_tool, etc."
+        }
+      },
+      "additionalProperties": false
+    },
+    "session": {
+      "type": "object",
+      "required": [
+        "id",
+        "role"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "team_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime": {
+          "type": "string",
+          "enum": [
+            "claude",
+            "codex",
+            "bash",
+            "unknown"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "actor_type": {
+          "type": "string",
+          "enum": [
+            "agent",
+            "human",
+            "bash",
+            "system",
+            "unknown"
+          ],
+          "description": "Who/what is acting: agent for Claude/Codex sessions, human for direct shell use, bash for shell-script automation."
+        }
+      },
+      "additionalProperties": true
+    },
+    "observation_lock": {
+      "type": "object",
+      "required": [
+        "required",
+        "satisfied"
+      ],
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "satisfied": {
+          "type": "boolean"
+        },
+        "lock_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "read_trace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "read_timestamp": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "expires_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "observed_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "policy": {
+      "type": "object",
+      "required": [
+        "mode",
+        "decision",
+        "required_read_before_write"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "observe",
+            "warn",
+            "strict"
+          ]
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "warn",
+            "block",
+            "fail_open"
+          ]
+        },
+        "required_read_before_write": {
+          "type": "boolean"
+        },
+        "block_supported": {
+          "type": "boolean"
+        },
+        "observation_lock": {
+          "type": "object",
+          "required": [
+            "required",
+            "satisfied"
+          ],
+          "properties": {
+            "required": {
+              "type": "boolean"
+            },
+            "satisfied": {
+              "type": "boolean"
+            },
+            "lock_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "read_trace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "read_timestamp": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "expires_at": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "observed_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "current_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "degradation_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "trace_ref": {
+      "type": "object",
+      "required": [
+        "trace_id",
+        "session_id",
+        "tool",
+        "resource_path",
+        "operation",
+        "intent",
+        "timestamp"
+      ],
+      "properties": {
+        "trace_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool": {
+          "type": "string"
+        },
+        "resource_path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "create",
+            "read",
+            "modify",
+            "delete",
+            "execute",
+            "touch",
+            "unknown"
+          ]
+        },
+        "intent": {
+          "type": "string"
+        },
+        "pre_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "post_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "duration_ms": {
+          "type": [
+            "number",
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "timestamp": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timestamp_iso": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "team_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "ratings_summary": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

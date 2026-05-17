@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aids.local/schemas/resource-index.schema.json",
+  "title": "AIDS ResourceIndex",
+  "type": "object",
+  "required": [
+    "resource_path",
+    "trace_ids",
+    "total_ops"
+  ],
+  "properties": {
+    "resource_path": {
+      "type": "string"
+    },
+    "trace_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "last_op": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_actor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_actor_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_intent": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_seen_at": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "last_writer": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_writer_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_write_intent": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_write_at": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "total_ops": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "last_actor_type": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "agent",
+        "human",
+        "bash",
+        "system",
+        "unknown",
+        null
+      ]
+    },
+    "last_runtime": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "claude",
+        "codex",
+        "bash",
+        "unknown",
+        null
+      ]
+    },
+    "timeline_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": true
+}

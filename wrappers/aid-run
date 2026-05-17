@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Run a shell command through AIDS/Agent-ID timeline tracing."""
+from __future__ import annotations
+import json, os, subprocess, sys, time, uuid
+from pathlib import Path
+
+cmd = sys.argv[1:]
+if not cmd:
+    print("usage: aid-run <command> [args...]\n       aid-run -- <shell command>\n\nlegacy alias; prefer aids-run", file=sys.stderr)
+    sys.exit(2)
+if cmd[0] == "--":
+    cmd = cmd[1:]
+command_text = " ".join(cmd)
+if len(cmd) == 1:
+    shell = True
+    run_cmd = cmd[0]
+else:
+    shell = False
+    run_cmd = cmd
+selftools = os.environ.get("AIDS_BIN") or os.environ.get("AID_BIN") or os.environ.get("SELFTOOLS_BIN")
+if not selftools:
+    here = Path(__file__).resolve()
+    candidate = here.parent.parent / "bin" / "selftools"
+    selftools = str(candidate if candidate.exists() else Path.home()/".local/bin/aid")
+if not Path(selftools).exists():
+    selftools = str(Path.home()/".local/bin/selftools")
+session = os.environ.get("AIDS_SESSION_ID") or os.environ.get("AID_SESSION_ID") or os.environ.get("SESSION_ID") or os.environ.get("SELFTOOLS_SESSION_ID") or os.environ.get("ZHUYI_SESSION_ID") or f"bash-{int(time.time())}-{os.getpid()}"
+os.environ.setdefault("AIDS_SESSION_ID", session)
+os.environ.setdefault("AID_SESSION_ID", session)
+os.environ.setdefault("SESSION_ID", session)
+os.environ.setdefault("AIDS_RUNTIME", "bash")
+os.environ.setdefault("SELFTOOLS_RUNTIME", "bash")
+tool_use_id = f"bash-{uuid.uuid4().hex[:12]}"
+base = {"session_id": session, "cwd": os.getcwd(), "permission_mode": "bash", "tool_name": "Bash", "tool_use_id": tool_use_id, "tool_input": {"command": command_text, "description": os.environ.get("AIDS_INTENT") or os.environ.get("AID_INTENT") or os.environ.get("INTENT") or "manual bash command"}}
+try:
+    subprocess.run([selftools, "hook", "pre-tool-use"], input=json.dumps(dict(base, hook_event_name="PreToolUse")), text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except Exception:
+    pass
+start = time.time()
+proc = subprocess.run(run_cmd, shell=shell)
+duration = int((time.time() - start) * 1000)
+try:
+    event = dict(base, hook_event_name="PostToolUse", duration_ms=duration, tool_response={"exit_code": proc.returncode, "success": proc.returncode == 0})
+    subprocess.run([selftools, "hook", "post-tool-use"], input=json.dumps(event), text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except Exception:
+    pass
+sys.exit(proc.returncode)

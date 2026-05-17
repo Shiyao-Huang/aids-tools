@@ -1,0 +1,13 @@
+{
+  "name": "aids-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AIDS (Agent-ID System): identity-aware trace and rating storage for Claude/Codex/Bash tool wrappers",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

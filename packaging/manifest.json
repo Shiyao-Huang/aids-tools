@@ -1,0 +1,86 @@
+{
+  "name": "aids",
+  "displayName": "AIDS / Agent-ID System / 意识工具",
+  "version": "0.1.0",
+  "description": "AIDS (Agent-ID System): identity-aware hook, Bash, and wrapper layer for Claude Code and Codex with shared timeline, session registry, read-before-write awareness, trace chain, ratings, and MCP query tools.",
+  "install": {
+    "entrypoint": "install.sh",
+    "oneLinePattern": "curl -sfL https://raw.githubusercontent.com/<org>/aids-tools/main/install.sh | bash",
+    "dataDirDefault": "~/.aids",
+    "installDirDefault": "~/.aids/selftools",
+    "binDirDefault": "~/.local/bin"
+  },
+  "binaries": [
+    "bin/selftools",
+    "bin/selftools-mcp",
+    "wrappers/claude-selftools",
+    "wrappers/codex-selftools",
+    "wrappers/aids-run",
+    "wrappers/aids-bash",
+    "wrappers/aid-run",
+    "wrappers/aid-bash"
+  ],
+  "runtimeHooks": {
+    "claude": {
+      "home": "~/.claude",
+      "settings": "~/.claude/settings.json",
+      "scripts": [
+        "~/.claude/hooks/selftools-session-start.sh",
+        "~/.claude/hooks/selftools-pre-tool-use.sh",
+        "~/.claude/hooks/selftools-post-tool-use.sh"
+      ],
+      "events": [
+        "SessionStart",
+        "PreToolUse",
+        "PostToolUse"
+      ]
+    },
+    "codex": {
+      "home": "~/.codex",
+      "settings": "~/.codex/hooks.json",
+      "mcpConfig": "~/.codex/config.toml",
+      "scripts": [
+        "~/.codex/hooks/selftools-session-start.sh",
+        "~/.codex/hooks/selftools-pre-tool-use.sh",
+        "~/.codex/hooks/selftools-post-tool-use.sh"
+      ],
+      "events": [
+        "SessionStart",
+        "PreToolUse",
+        "PostToolUse"
+      ]
+    },
+    "bash": {
+      "home": "shell PATH",
+      "scripts": [
+        "~/.local/bin/aids-run",
+        "~/.local/bin/aids-bash",
+        "~/.local/bin/aid-run (legacy)",
+        "~/.local/bin/aid-bash (legacy)"
+      ],
+      "events": [
+        "manual Bash command timeline trace"
+      ]
+    }
+  },
+  "mcpTools": [
+    "aids_who_touched",
+    "aids_session_info",
+    "aids_op_chain",
+    "aids_rate",
+    "aids_doctor",
+    "selftools_* legacy aliases"
+  ],
+  "stores": [
+    "~/.aids/sessions/{session_id}.json",
+    "~/.aids/traces/YYYY-MM-DD.jsonl",
+    "~/.aids/timeline/YYYY-MM-DD.jsonl",
+    "~/.aids/index/{base64(resource)}.json",
+    "~/.aids/ratings/YYYY-MM-DD.jsonl"
+  ],
+  "uninstall": {
+    "command": "~/.aids/selftools/install.sh --uninstall",
+    "preservesDataByDefault": true,
+    "purgeDataFlag": "--purge-data"
+  }
+}

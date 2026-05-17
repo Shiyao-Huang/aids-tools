@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# AIDS-covered Bash entrypoint. `aids-bash -c "cmd"` records cmd in the shared AIDS timeline.
+# Interactive mode prints a small hint; use `aids-run <cmd>` for traced commands.
+export AIDS_RUNTIME="bash"
+export SELFTOOLS_RUNTIME="${SELFTOOLS_RUNTIME:-bash}"
+export AIDS_SESSION_ID="${AIDS_SESSION_ID:-${SESSION_ID:-bash-$(date +%Y%m%d%H%M%S)-$$}}"
+export SESSION_ID="$AIDS_SESSION_ID"
+if [ "${1:-}" = "-c" ] && [ -n "${2:-}" ]; then
+  exec "${AIDS_RUN_BIN:-$HOME/.local/bin/aids-run}" -- "$2"
+fi
+echo "AIDS bash session: $AIDS_SESSION_ID"
+echo "Use: aids-run <command>  # records the command in ~/.aids/timeline"
+exec bash "$@"

@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+"""AIDS (Agent-ID System): identity-aware trace CLI and hook handler.
+
+No third-party dependencies. The filesystem is the database:
+  ~/.aids/sessions/{session_id}.json
+  ~/.aids/traces/YYYY-MM-DD.jsonl
+  ~/.aids/timeline/YYYY-MM-DD.jsonl
+  ~/.aids/index/{base64(resource)}.json
+  ~/.aids/ratings/YYYY-MM-DD.jsonl
+
+Legacy aliases (selftools, AID_*, ZHUYI_*, ~/.zhuyi) remain readable during
+migration, but the public name is AIDS and new installs write under ~/.aids.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import shlex
+import socket
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore
+
+APP = "aids"
+ZH_NAME = "AIDS (Agent-ID System)"
+
+
+def env_first(*names: str) -> Optional[str]:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+DEFAULT_DATA_DIR = Path(env_first("AIDS_DATA_DIR", "AIDS_HOME", "AID_DATA_DIR", "AID_HOME", "SELFTOOLS_DATA_DIR", "SELFTOOLS_HOME", "CONSCIOUS_TOOLS_HOME", "ZHUYI_DATA_DIR", "ZHUYI_HOME") or "~/.aids").expanduser()
+RECENT_LIMIT = int(env_first("AIDS_RECENT_LIMIT", "AID_RECENT_LIMIT", "SELFTOOLS_RECENT_LIMIT", "ZHUYI_RECENT_LIMIT") or "5")
+
+WRITE_TOOL_NAMES = {"Write", "Edit", "MultiEdit", "NotebookEdit", "apply_patch"}
+READ_TOOL_NAMES = {"Read"}
+TRACE_TOOL_NAMES = WRITE_TOOL_NAMES | READ_TOOL_NAMES | {"Bash"}
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def iso_now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+def today() -> str:
+    return _dt.datetime.now().strftime("%Y-%m-%d")
+
+
+def data_dir() -> Path:
+    return DEFAULT_DATA_DIR
+
+
+def ensure_layout() -> None:
+    for rel in ["sessions", "traces", "timeline", "index", "ratings", "pending", "locks", "logs"]:
+        (data_dir() / rel).mkdir(parents=True, exist_ok=True)
+
+
+def eprint(*args: Any) -> None:
+    print(*args, file=sys.stderr)
+
+
+def read_stdin_json() -> Dict[str, Any]:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        # Hooks should never crash the host runtime over malformed input.
+        append_log({"level": "error", "event": "bad_hook_json", "error": str(exc), "raw_prefix": raw[:500]})
+        return {"_raw": raw, "_error": str(exc)}
+
+
+def append_log(record: Dict[str, Any]) -> None:
+    try:
+        ensure_layout()
+        record.setdefault("timestamp", now_ms())
+        record.setdefault("ts", iso_now())
+        path = data_dir() / "logs" / f"{today()}.jsonl"
+        append_jsonl(path, record)
+    except Exception:
+        pass
+
+
+def json_dump(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def json_line(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def write_json_atomic(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(json_dump(obj) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError:
+        return default
+
+
+class FileLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.fd: Optional[Any] = None
+
+    def __enter__(self) -> "FileLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = open(self.path, "a+", encoding="utf-8")
+        if fcntl is not None:
+            fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.fd is not None:
+            if fcntl is not None:
+                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+            self.fd.close()
+
+
+def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = data_dir() / "locks" / (path.name + ".lock")
+    with FileLock(lock_path):
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json_line(record) + "\n")
+
+
+def sha256_file(path: Path) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
+        return None
+
+
+def short(s: Any, n: int = 160) -> str:
+    text = str(s or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= n:
+        return text
+    return text[: n - 1] + "…"
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def infer_runtime(event: Dict[str, Any]) -> str:
+    env_runtime = env_first("AIDS_RUNTIME", "AID_RUNTIME", "SELFTOOLS_RUNTIME", "ZHUYI_RUNTIME")
+    if env_runtime:
+        return env_runtime
+    transcript = str(event.get("transcript_path") or "")
+    if ".codex" in transcript:
+        return "codex"
+    if ".claude" in transcript:
+        return "claude"
+    # Claude hooks expose CLAUDE_ENV_FILE on SessionStart/Setup/CwdChanged/FileChanged.
+    if os.environ.get("CLAUDE_ENV_FILE"):
+        return "claude"
+    return "unknown"
+
+
+def infer_actor_type(runtime: str) -> str:
+    actor_type = env_first("AIDS_ACTOR_TYPE", "AID_ACTOR_TYPE", "SELFTOOLS_ACTOR_TYPE", "ZHUYI_ACTOR_TYPE")
+    if actor_type:
+        return actor_type
+    if runtime in {"claude", "codex"}:
+        return "agent"
+    if runtime == "bash":
+        return "human" if env_first("AIDS_SESSION_ID", "AID_SESSION_ID", "SESSION_ID", "SELFTOOLS_SESSION_ID", "ZHUYI_SESSION_ID") else "bash"
+    return "unknown"
+
+
+def session_id_from(event: Dict[str, Any]) -> str:
+    return (
+        env_first("AIDS_SESSION_ID", "AID_SESSION_ID", "SESSION_ID", "SELFTOOLS_SESSION_ID", "ZHUYI_SESSION_ID", "AHA_SESSION_ID")
+        or str(event.get("session_id") or "")
+        or f"local-{socket.gethostname()}-{os.getpid()}"
+    )
+
+
+def session_path(session_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)
+    return data_dir() / "sessions" / f"{safe}.json"
+
+
+def load_session(session_id: str) -> Dict[str, Any]:
+    return read_json(session_path(session_id), {}) or {}
+
+
+def register_session(event: Dict[str, Any], *, source: str = "hook") -> Dict[str, Any]:
+    ensure_layout()
+    sid = session_id_from(event)
+    path = session_path(sid)
+    old = read_json(path, {}) or {}
+    ts = now_ms()
+    runtime = infer_runtime(event)
+    actor_type = infer_actor_type(runtime)
+    cwd = str(event.get("cwd") or os.getcwd())
+    record = dict(old)
+    record.update(
+        {
+            "session_id": sid,
+            "runtime": runtime if runtime != "unknown" else old.get("runtime", runtime),
+            "model": event.get("model") or old.get("model") or env_first("AIDS_MODEL", "AID_MODEL", "SELFTOOLS_MODEL", "ZHUYI_MODEL"),
+            "display_name": os.environ.get("AIDS_DISPLAY_NAME") or os.environ.get("AID_DISPLAY_NAME") or os.environ.get("SELFTOOLS_DISPLAY_NAME") or os.environ.get("ZHUYI_DISPLAY_NAME") or old.get("display_name") or sid,
+            "role": os.environ.get("AIDS_ROLE") or os.environ.get("AID_ROLE") or os.environ.get("ROLE") or os.environ.get("SELFTOOLS_ROLE") or os.environ.get("ZHUYI_ROLE") or os.environ.get("AHA_ROLE") or old.get("role") or "unknown",
+            "actor_type": actor_type,
+            "team_id": env_first("AIDS_TEAM_ID", "AID_TEAM_ID", "TEAM_ID", "SELFTOOLS_TEAM_ID", "ZHUYI_TEAM_ID", "AHA_TEAM_ID") or old.get("team_id"),
+            "task_id": env_first("AIDS_TASK_ID", "AID_TASK_ID", "TASK_ID", "SELFTOOLS_TASK_ID", "ZHUYI_TASK_ID", "AHA_TASK_ID") or old.get("task_id"),
+            "goal": os.environ.get("AIDS_INTENT") or os.environ.get("AID_INTENT") or os.environ.get("INTENT") or os.environ.get("SELFTOOLS_INTENT") or os.environ.get("ZHUYI_INTENT") or old.get("goal") or "unspecified",
+            "project_path": cwd,
+            "transcript_path": event.get("transcript_path") or old.get("transcript_path"),
+            "permission_mode": event.get("permission_mode") or old.get("permission_mode"),
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "status": "active",
+            "source": source,
+            "last_seen_at": ts,
+            "last_seen_iso": iso_now(),
+        }
+    )
+    record.setdefault("started_at", ts)
+    record.setdefault("started_iso", iso_now())
+    write_json_atomic(path, record)
+    return record
+
+
+def normalize_resource(raw: str, cwd: Optional[str] = None) -> str:
+    if not raw:
+        return "unknown"
+    raw = str(raw)
+    if raw.startswith("bash:") or raw.startswith("mcp:"):
+        return raw
+    # Keep URI-like targets stable.
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw):
+        return raw
+    base = Path(cwd or os.getcwd()).expanduser()
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = base / p
+    try:
+        resolved = p.resolve(strict=False)
+    except Exception:
+        resolved = p.absolute()
+    return str(resolved)
+
+
+def index_key(resource: str) -> str:
+    return base64.urlsafe_b64encode(resource.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def index_path(resource: str) -> Path:
+    return data_dir() / "index" / f"{index_key(resource)}.json"
+
+
+def load_index(resource: str) -> Dict[str, Any]:
+    return read_json(index_path(resource), {}) or {}
+
+
+def update_index(resource: str, trace: Dict[str, Any], session: Dict[str, Any]) -> None:
+    path = index_path(resource)
+    lock_path = data_dir() / "locks" / f"index-{index_key(resource)}.lock"
+    with FileLock(lock_path):
+        idx = read_json(path, {}) or {}
+        trace_ids = list(idx.get("trace_ids") or [])
+        trace_ids.append(trace["trace_id"])
+        # Keep a bounded index list for fast lookup while JSONL remains canonical.
+        trace_ids = trace_ids[-500:]
+        idx.update(
+            {
+                "resource_path": resource,
+                "trace_ids": trace_ids,
+                "last_op": trace.get("operation"),
+                "last_actor": trace.get("session_id"),
+                "last_actor_role": session.get("role"),
+                "last_actor_type": trace.get("actor_type") or session.get("actor_type"),
+                "last_runtime": trace.get("runtime") or session.get("runtime"),
+                "last_intent": trace.get("intent"),
+                "last_seen_at": trace.get("timestamp"),
+                "timeline_path": str(data_dir() / "timeline" / f"{today()}.jsonl"),
+                "total_ops": int(idx.get("total_ops") or 0) + 1,
+            }
+        )
+        if trace.get("operation") in {"create", "modify", "delete"}:
+            idx.update(
+                {
+                    "last_writer": trace.get("session_id"),
+                    "last_writer_role": session.get("role"),
+                    "last_write_intent": trace.get("intent"),
+                    "last_write_at": trace.get("timestamp"),
+                }
+            )
+        write_json_atomic(path, idx)
+
+
+def traces_file_for_today() -> Path:
+    return data_dir() / "traces" / f"{today()}.jsonl"
+
+
+def timeline_file_for_today() -> Path:
+    return data_dir() / "timeline" / f"{today()}.jsonl"
+
+
+def timeline_event_from_trace(trace: Dict[str, Any], event: Dict[str, Any], session: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "schema_version": "aids.timeline.v1",
+        "event_id": new_id("ev"),
+        "trace_id": trace.get("trace_id"),
+        "parent_trace_id": trace.get("parent_trace_id"),
+        "timestamp": trace.get("timestamp"),
+        "timestamp_iso": trace.get("timestamp_iso"),
+        "actor_type": trace.get("actor_type") or session.get("actor_type") or "unknown",
+        "runtime": trace.get("runtime") or session.get("runtime") or "unknown",
+        "session_id": trace.get("session_id") or "unknown",
+        "role": session.get("role"),
+        "tool": trace.get("tool") or "unknown",
+        "resource": trace.get("resource_path") or "unknown",
+        "intent": trace.get("intent") or "unspecified",
+        "operation": trace.get("operation"),
+        "result": event.get("tool_response"),
+        "native": {"hook_event": event.get("hook_event_name"), "tool_use_id": event.get("tool_use_id")},
+        "metadata": {"trace": trace},
+    }
+
+
+def trace_paths() -> Iterable[Path]:
+    traces_dir = data_dir() / "traces"
+    if not traces_dir.exists():
+        return []
+    return sorted(traces_dir.glob("*.jsonl"))
+
+
+def read_trace(trace_id: str) -> Optional[Dict[str, Any]]:
+    for path in trace_paths():
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if trace_id in line:
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if obj.get("trace_id") == trace_id:
+                            return obj
+        except FileNotFoundError:
+            continue
+    return None
+
+
+def recent_traces(resource: str, limit: int = RECENT_LIMIT) -> List[Dict[str, Any]]:
+    idx = load_index(resource)
+    ids = list(idx.get("trace_ids") or [])[-limit:]
+    out: List[Dict[str, Any]] = []
+    for tid in ids:
+        trace = read_trace(tid)
+        if trace:
+            sess = load_session(str(trace.get("session_id") or ""))
+            trace = dict(trace)
+            trace["session"] = sess
+            out.append(trace)
+    return out
+
+
+def detect_resources(tool_name: str, tool_input: Any, cwd: str) -> List[str]:
+    resources: List[str] = []
+    if not isinstance(tool_input, dict):
+        return resources
+    # Claude file tools.
+    for key in ("file_path", "filePath", "path"):
+        val = tool_input.get(key)
+        if isinstance(val, str) and val and tool_name not in {"Bash"}:
+            resources.append(normalize_resource(val, cwd))
+    # Codex apply_patch exposes patch text under command.
+    if tool_name == "apply_patch" or ("*** Begin Patch" in str(tool_input.get("command") or "")):
+        resources.extend(parse_apply_patch_resources(str(tool_input.get("command") or ""), cwd))
+    if tool_name == "Bash":
+        cmd = short(tool_input.get("command") or "", 240)
+        resources.append(f"bash:{cmd}")
+    if tool_name.startswith("mcp__"):
+        resources.append(f"mcp:{tool_name}")
+    # De-dupe while preserving order.
+    seen = set()
+    clean = []
+    for res in resources:
+        if res and res not in seen:
+            seen.add(res)
+            clean.append(res)
+    return clean
+
+
+def parse_apply_patch_resources(command: str, cwd: str) -> List[str]:
+    resources: List[str] = []
+    patterns = [
+        r"^\*\*\* (?:Update|Add|Delete) File: (.+)$",
+        r"^---\s+(?:a/)?(.+)$",
+        r"^\+\+\+\s+(?:b/)?(.+)$",
+    ]
+    for line in command.splitlines():
+        for pat in patterns:
+            m = re.match(pat, line.strip())
+            if m:
+                name = m.group(1).strip()
+                if name != "/dev/null":
+                    resources.append(normalize_resource(name, cwd))
+                break
+    seen = set()
+    out = []
+    for res in resources:
+        if res not in seen:
+            seen.add(res)
+            out.append(res)
+    return out
+
+
+def operation_for(tool_name: str, resource: str, pre_hash: Optional[str], post_hash: Optional[str]) -> str:
+    if tool_name == "Read":
+        return "read"
+    if tool_name == "Bash" or resource.startswith("bash:"):
+        return "execute"
+    if post_hash is None and pre_hash is not None:
+        return "delete"
+    if pre_hash is None and post_hash is not None:
+        return "create"
+    if pre_hash != post_hash:
+        return "modify"
+    return "touch"
+
+
+def pending_path(tool_use_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tool_use_id or "unknown")
+    return data_dir() / "pending" / f"{safe}.json"
+
+
+def save_pending(event: Dict[str, Any], session: Dict[str, Any], resources: List[str]) -> None:
+    tool_use_id = str(event.get("tool_use_id") or event.get("turn_id") or new_id("pending"))
+    cwd = str(event.get("cwd") or os.getcwd())
+    pending_resources = []
+    for res in resources:
+        pre_hash = None if res.startswith(("bash:", "mcp:")) else sha256_file(Path(res))
+        pending_resources.append({"resource_path": res, "pre_hash": pre_hash})
+    record = {
+        "tool_use_id": tool_use_id,
+        "session_id": session.get("session_id"),
+        "tool_name": event.get("tool_name"),
+        "tool_input": event.get("tool_input"),
+        "resources": pending_resources,
+        "cwd": cwd,
+        "timestamp": now_ms(),
+    }
+    write_json_atomic(pending_path(tool_use_id), record)
+
+
+def load_pending(event: Dict[str, Any]) -> Dict[str, Any]:
+    tool_use_id = str(event.get("tool_use_id") or event.get("turn_id") or "")
+    if tool_use_id:
+        return read_json(pending_path(tool_use_id), {}) or {}
+    return {}
+
+
+def remove_pending(event: Dict[str, Any]) -> None:
+    tool_use_id = str(event.get("tool_use_id") or event.get("turn_id") or "")
+    if not tool_use_id:
+        return
+    try:
+        pending_path(tool_use_id).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def format_recent_context(resources: List[str], session: Dict[str, Any], limit: int = RECENT_LIMIT) -> str:
+    lines: List[str] = []
+    for res in resources:
+        traces = recent_traces(res, limit=limit)
+        display = res
+        try:
+            cwd = session.get("project_path") or os.getcwd()
+            display = os.path.relpath(res, cwd) if not res.startswith(("bash:", "mcp:")) else res
+        except Exception:
+            pass
+        if not traces:
+            lines.append(f"- {display}: no prior {ZH_NAME} trace found.")
+            continue
+        lines.append(f"- {display}: recent trace chain")
+        for tr in traces[-limit:]:
+            sess = tr.get("session") or {}
+            actor = sess.get("display_name") or tr.get("session_id") or "unknown"
+            role = sess.get("role") or "unknown"
+            intent = tr.get("intent") or sess.get("goal") or "unspecified"
+            op = tr.get("operation") or tr.get("tool")
+            ts = tr.get("timestamp")
+            ago = human_ago(ts) if isinstance(ts, int) else "unknown time"
+            lines.append(f"  • {op} by {actor} ({role}) {ago}; intent: {short(intent, 120)}; trace: {tr.get('trace_id')}")
+    return "\n".join(lines)
+
+
+def human_ago(timestamp_ms: int) -> str:
+    delta = max(0, now_ms() - timestamp_ms) / 1000.0
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
+def hook_output(event_name: str, message: str, *, post: bool = False) -> None:
+    # Emit both Claude-friendly hookSpecificOutput and Codex-friendly systemMessage.
+    out: Dict[str, Any] = {"systemMessage": message}
+    hook_specific: Dict[str, Any] = {"hookEventName": event_name}
+    if event_name in {"SessionStart", "PreToolUse", "PostToolUse"}:
+        hook_specific["additionalContext"] = message
+    if post:
+        # Claude PostToolUse supports top-level additionalContext too.
+        out["additionalContext"] = message
+    out["hookSpecificOutput"] = hook_specific
+    print(json_line(out))
+
+
+def cmd_hook_session_start(_: argparse.Namespace) -> int:
+    event = read_stdin_json()
+    session = register_session(event, source="session-start")
+    env_lines = [
+        f"export AIDS_SESSION_ID={shlex.quote(str(session['session_id']))}",
+        f"export AID_SESSION_ID={shlex.quote(str(session['session_id']))}",
+        f"export SESSION_ID={shlex.quote(str(session['session_id']))}",
+        f"export ZHUYI_SESSION_ID={shlex.quote(str(session['session_id']))}",
+        f"export SELFTOOLS_SESSION_ID={shlex.quote(str(session['session_id']))}",
+        f"export AIDS_RUNTIME={shlex.quote(str(session.get('runtime') or 'unknown'))}",
+        f"export AIDS_ACTOR_TYPE={shlex.quote(str(session.get('actor_type') or 'unknown'))}",
+        f"export AIDS_DATA_DIR={shlex.quote(str(data_dir()))}",
+        f"export AIDS_HOME={shlex.quote(str(data_dir()))}",
+        f"export AID_DATA_DIR={shlex.quote(str(data_dir()))}",
+        f"export AID_HOME={shlex.quote(str(data_dir()))}",
+        f"export ZHUYI_DATA_DIR={shlex.quote(str(data_dir()))}",
+        f"export SELFTOOLS_DATA_DIR={shlex.quote(str(data_dir()))}",
+    ]
+    env_file = os.environ.get("CLAUDE_ENV_FILE")
+    if env_file:
+        try:
+            with open(env_file, "a", encoding="utf-8") as fh:
+                fh.write("\n# AIDS (Agent-ID System) session identity; legacy aliases included\n")
+                fh.write("\n".join(env_lines) + "\n")
+        except OSError as exc:
+            append_log({"level": "warn", "event": "env_file_write_failed", "error": str(exc)})
+    message = (
+        f"{ZH_NAME} session registered. session_id={session['session_id']} runtime={session.get('runtime')} "
+        f"role={session.get('role')} goal={short(session.get('goal'), 120)}. "
+        f"Use `aids who-touched <path>` or `aids op-chain <path>` before risky edits."
+    )
+    hook_output("SessionStart", message)
+    return 0
+
+
+def cmd_hook_pre_tool_use(_: argparse.Namespace) -> int:
+    event = read_stdin_json()
+    session = register_session(event, source="pre-tool-use")
+    tool_name = str(event.get("tool_name") or "")
+    cwd = str(event.get("cwd") or os.getcwd())
+    resources = detect_resources(tool_name, event.get("tool_input"), cwd)
+    if resources:
+        save_pending(event, session, resources)
+    if tool_name in WRITE_TOOL_NAMES and resources:
+        context = format_recent_context(resources, session)
+        message = f"写前必读 / AIDS awareness for {tool_name}:\n{context}"
+        hook_output("PreToolUse", message)
+    return 0
+
+
+def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
+    event = read_stdin_json()
+    session = register_session(event, source="post-tool-use")
+    tool_name = str(event.get("tool_name") or "")
+    cwd = str(event.get("cwd") or os.getcwd())
+    pending = load_pending(event)
+    resources_from_pending = pending.get("resources") or []
+    if resources_from_pending:
+        resources = [str(r.get("resource_path")) for r in resources_from_pending if r.get("resource_path")]
+        pre_by_resource = {str(r.get("resource_path")): r.get("pre_hash") for r in resources_from_pending}
+    else:
+        resources = detect_resources(tool_name, event.get("tool_input"), cwd)
+        pre_by_resource = {res: (None if res.startswith(("bash:", "mcp:")) else sha256_file(Path(res))) for res in resources}
+    trace_ids: List[str] = []
+    intent = env_first("AIDS_INTENT", "AID_INTENT", "INTENT", "SELFTOOLS_INTENT", "ZHUYI_INTENT") or session.get("goal") or tool_intent(event)
+    for res in resources:
+        pre_hash = pre_by_resource.get(res)
+        post_hash = None if res.startswith(("bash:", "mcp:")) else sha256_file(Path(res))
+        if tool_name == "Read":
+            post_hash = None
+        trace = {
+            "trace_id": new_id("tr"),
+            "session_id": session.get("session_id"),
+            "tool": tool_name or "unknown",
+            "resource_path": res,
+            "operation": operation_for(tool_name, res, pre_hash, post_hash),
+            "intent": intent,
+            "pre_hash": pre_hash,
+            "post_hash": post_hash,
+            "duration_ms": event.get("duration_ms"),
+            "timestamp": now_ms(),
+            "timestamp_iso": iso_now(),
+            "runtime": session.get("runtime") or infer_runtime(event),
+            "actor_type": session.get("actor_type") or infer_actor_type(str(session.get("runtime") or "unknown")),
+            "team_id": session.get("team_id"),
+            "cwd": cwd,
+            "tool_use_id": event.get("tool_use_id"),
+            "metadata": {
+                "runtime": session.get("runtime"),
+                "permission_mode": event.get("permission_mode"),
+                "tool_response_preview": short(event.get("tool_response"), 500),
+            },
+        }
+        trace["timeline_path"] = str(timeline_file_for_today())
+        append_jsonl(traces_file_for_today(), trace)
+        append_jsonl(timeline_file_for_today(), timeline_event_from_trace(trace, event, session))
+        update_index(res, trace, session)
+        trace_ids.append(trace["trace_id"])
+    remove_pending(event)
+    if trace_ids:
+        hook_output("PostToolUse", f"{ZH_NAME} recorded {len(trace_ids)} trace(s): {', '.join(trace_ids)}", post=True)
+    return 0
+
+
+def tool_intent(event: Dict[str, Any]) -> str:
+    ti = event.get("tool_input")
+    if isinstance(ti, dict):
+        for key in ("description", "prompt", "command"):
+            if ti.get(key):
+                return short(ti.get(key), 220)
+    return "unspecified"
+
+
+def print_traces_for_resource(resource_arg: str, limit: int, *, as_json: bool = False) -> int:
+    res = normalize_resource(resource_arg)
+    traces = recent_traces(res, limit=limit)
+    if as_json:
+        print(json_dump({"resource_path": res, "traces": traces}))
+        return 0
+    if not traces:
+        print(f"No {ZH_NAME} traces for {res}")
+        return 1
+    print(f"{ZH_NAME} traces for {res}:")
+    for tr in traces:
+        sess = tr.get("session") or {}
+        actor = sess.get("display_name") or tr.get("session_id")
+        print(
+            f"- {tr.get('trace_id')} {tr.get('operation')} {tr.get('tool')} by {actor} "
+            f"({sess.get('role', 'unknown')}) {human_ago(int(tr.get('timestamp') or now_ms()))}; intent: {short(tr.get('intent'), 140)}"
+        )
+    return 0
+
+
+def cmd_who_touched(args: argparse.Namespace) -> int:
+    return print_traces_for_resource(args.path, args.limit, as_json=args.json)
+
+
+def cmd_op_chain(args: argparse.Namespace) -> int:
+    return print_traces_for_resource(args.path, args.limit, as_json=args.json)
+
+
+def cmd_session_info(args: argparse.Namespace) -> int:
+    record = load_session(args.session_id)
+    if not record:
+        print(f"No session found for {args.session_id}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json_dump(record))
+    else:
+        print(f"session_id: {record.get('session_id')}")
+        print(f"runtime:    {record.get('runtime')}")
+        print(f"role:       {record.get('role')}")
+        print(f"display:    {record.get('display_name')}")
+        print(f"goal:       {record.get('goal')}")
+        print(f"task_id:    {record.get('task_id')}")
+        print(f"last_seen:  {record.get('last_seen_iso')}")
+    return 0
+
+
+def cmd_retire_session(args: argparse.Namespace) -> int:
+    ensure_layout()
+    sid = args.session_id
+    record = load_session(sid)
+    if not record:
+        print(f"No session found for {sid}", file=sys.stderr)
+        return 1
+    record["status"] = "retired"
+    record["last_seen_at"] = now_ms()
+    record["last_seen_iso"] = iso_now()
+    if args.reason:
+        record["retire_reason"] = args.reason
+    write_json_atomic(session_path(sid), record)
+    if args.json:
+        print(json_dump(record))
+    else:
+        print(f"Session {sid} retired.")
+    return 0
+
+
+def cmd_list_sessions(args: argparse.Namespace) -> int:
+    ensure_layout()
+    sessions_dir = data_dir() / "sessions"
+    if not sessions_dir.exists():
+        print("No sessions found." if not args.json else '{"sessions": []}')
+        return 0
+    records = []
+    for f in sorted(sessions_dir.glob("*.json")):
+        rec = read_json(f, {})
+        if rec:
+            records.append(rec)
+    if args.status:
+        records = [r for r in records if r.get("status") == args.status]
+    if args.role:
+        records = [r for r in records if r.get("role") == args.role]
+    if args.runtime:
+        records = [r for r in records if r.get("runtime") == args.runtime]
+    if args.json:
+        print(json_dump({"sessions": records}))
+    else:
+        if not records:
+            print("No matching sessions.")
+            return 0
+        for r in records:
+            sid = r.get("session_id", "?")
+            role = r.get("role", "?")
+            status = r.get("status", "?")
+            name = r.get("display_name", "")
+            goal = short(r.get("goal"), 60)
+            print(f"  {sid}  {role:15s}  {status:8s}  {name:30s}  {goal}")
+    return 0
+
+
+def cmd_heartbeat(args: argparse.Namespace) -> int:
+    ensure_layout()
+    sid = args.session_id
+    record = load_session(sid)
+    if not record:
+        print(f"No session found for {sid}", file=sys.stderr)
+        return 1
+    record["last_seen_at"] = now_ms()
+    record["last_seen_iso"] = iso_now()
+    write_json_atomic(session_path(sid), record)
+    if args.json:
+        print(json_dump(record))
+    else:
+        print(f"Session {sid} heartbeat at {record['last_seen_iso']}.")
+    return 0
+
+
+def cmd_whois(args: argparse.Namespace) -> int:
+    ensure_layout()
+    sid = args.session_id
+    record = load_session(sid)
+    if not record:
+        print(f"Unknown session: {sid}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json_dump(record))
+        return 0
+    age_min = round((now_ms() - (record.get("started_at") or now_ms())) / 60000)
+    last = record.get("last_seen_at") or record.get("started_at") or now_ms()
+    ago = round((now_ms() - last) / 60000)
+    print(f"Session: {record.get('session_id')}")
+    print(f"  Role:         {record.get('role', '?')}")
+    print(f"  Name:         {record.get('display_name', '(unnamed)')}")
+    print(f"  Runtime:      {record.get('runtime', '?')}{('/' + record['model']) if record.get('model') else ''}")
+    print(f"  Goal:         {record.get('goal', '(none)')}")
+    print(f"  Task:         {record.get('task_id', '(none)')}")
+    print(f"  Team:         {record.get('team_id', '(none)')}")
+    print(f"  Project:      {record.get('project_path', '(none)')}")
+    print(f"  Status:       {record.get('status', '?')}")
+    print(f"  Uptime:       {age_min}m")
+    print(f"  Last seen:    {ago}m ago")
+    return 0
+
+
+def cmd_register_session(args: argparse.Namespace) -> int:
+    event = {
+        "session_id": args.session_id or env_first("AIDS_SESSION_ID", "AID_SESSION_ID", "SESSION_ID", "SELFTOOLS_SESSION_ID", "ZHUYI_SESSION_ID") or new_id("sess"),
+        "cwd": args.cwd or os.getcwd(),
+        "model": args.model,
+    }
+    # Supply env-like overrides through process env to keep one code path.
+    if args.runtime:
+        os.environ["AIDS_RUNTIME"] = args.runtime
+    if args.role:
+        os.environ["AIDS_ROLE"] = args.role
+    if args.goal:
+        os.environ["AIDS_INTENT"] = args.goal
+    if args.team_id:
+        os.environ["AIDS_TEAM_ID"] = args.team_id
+    if args.task_id:
+        os.environ["AIDS_TASK_ID"] = args.task_id
+    record = register_session(event, source="cli")
+    print(json_dump(record))
+    return 0
+
+
+def cmd_rate(args: argparse.Namespace) -> int:
+    ensure_layout()
+    trace = read_trace(args.trace_id)
+    if trace is None:
+        print(f"Trace not found: {args.trace_id}", file=sys.stderr)
+        return 1
+    rater = env_first("AIDS_SESSION_ID", "AID_SESSION_ID", "SESSION_ID", "SELFTOOLS_SESSION_ID", "ZHUYI_SESSION_ID") or "anonymous"
+    rating = {
+        "rating_id": new_id("rt"),
+        "trace_id": args.trace_id,
+        "rater_session_id": rater,
+        "score": args.score,
+        "comment": " ".join(args.comment).strip(),
+        "context": env_first("AIDS_INTENT", "AID_INTENT", "INTENT", "SELFTOOLS_INTENT", "ZHUYI_INTENT"),
+        "timestamp": now_ms(),
+        "timestamp_iso": iso_now(),
+        "runtime": env_first("AIDS_RUNTIME", "AID_RUNTIME", "SELFTOOLS_RUNTIME", "ZHUYI_RUNTIME") or "unknown",
+        "rater_actor_type": env_first("AIDS_ACTOR_TYPE", "AID_ACTOR_TYPE", "SELFTOOLS_ACTOR_TYPE", "ZHUYI_ACTOR_TYPE") or "unknown",
+    }
+    append_jsonl(data_dir() / "ratings" / f"{today()}.jsonl", rating)
+    print(json_dump(rating))
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    ensure_layout()
+    checks = []
+    checks.append(check("data_dir", data_dir().exists(), str(data_dir())))
+    checks.append(check("sessions_dir", (data_dir() / "sessions").exists(), str(data_dir() / "sessions")))
+    checks.append(check("traces_dir", (data_dir() / "traces").exists(), str(data_dir() / "traces")))
+    claude_settings = Path(os.environ.get("CLAUDE_HOME", str(Path.home() / ".claude"))) / "settings.json"
+    codex_hooks = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "hooks.json"
+    codex_config = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"
+    checks.append(check("claude_settings", file_contains(claude_settings, "selftools") or file_contains(claude_settings, "aids"), str(claude_settings)))
+    checks.append(check("codex_hooks", file_contains(codex_hooks, "selftools") or file_contains(codex_hooks, "aids"), str(codex_hooks)))
+    checks.append(check("codex_mcp", file_contains(codex_config, "mcp_servers.selftools") or file_contains(codex_config, "mcp_servers.aids"), str(codex_config)))
+    if args.json:
+        print(json_dump({"ok": all(c["ok"] for c in checks[:3]), "checks": checks}))
+    else:
+        print(f"{ZH_NAME} doctor")
+        for c in checks:
+            mark = "✅" if c["ok"] else "⚠️ "
+            print(f"{mark} {c['name']}: {c['detail']}")
+    return 0 if all(c["ok"] for c in checks[:3]) else 1
+
+
+def check(name: str, ok: bool, detail: str) -> Dict[str, Any]:
+    return {"name": name, "ok": bool(ok), "detail": detail}
+
+
+def file_contains(path: Path, needle: str) -> bool:
+    try:
+        return needle in path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="aids", description="AIDS (Agent-ID System) identity-aware trace CLI")
+    p.add_argument("--data-dir", help="Override ~/.aids data dir for this invocation")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    hook = sub.add_parser("hook", help="Run hook handler")
+    hook_sub = hook.add_subparsers(dest="hook_cmd", required=True)
+    hook_sub.add_parser("session-start").set_defaults(func=cmd_hook_session_start)
+    hook_sub.add_parser("pre-tool-use").set_defaults(func=cmd_hook_pre_tool_use)
+    hook_sub.add_parser("post-tool-use").set_defaults(func=cmd_hook_post_tool_use)
+
+    reg = sub.add_parser("register-session", help="Register/update a session identity")
+    reg.add_argument("--session-id")
+    reg.add_argument("--runtime", choices=["claude", "codex", "unknown"])
+    reg.add_argument("--role")
+    reg.add_argument("--goal")
+    reg.add_argument("--team-id")
+    reg.add_argument("--task-id")
+    reg.add_argument("--model")
+    reg.add_argument("--cwd")
+    reg.set_defaults(func=cmd_register_session)
+
+    sess = sub.add_parser("session-info", help="Lookup a session")
+    sess.add_argument("session_id")
+    sess.add_argument("--json", action="store_true")
+    sess.set_defaults(func=cmd_session_info)
+
+    retire = sub.add_parser("retire-session", help="Mark a session as retired")
+    retire.add_argument("session_id")
+    retire.add_argument("--reason", help="Reason for retirement")
+    retire.add_argument("--json", action="store_true")
+    retire.set_defaults(func=cmd_retire_session)
+
+    ls = sub.add_parser("list-sessions", help="List registered sessions")
+    ls.add_argument("--status", choices=["active", "retired", "archived"], help="Filter by status")
+    ls.add_argument("--role", help="Filter by role")
+    ls.add_argument("--runtime", choices=["claude", "codex", "unknown"], help="Filter by runtime")
+    ls.add_argument("--json", action="store_true")
+    ls.set_defaults(func=cmd_list_sessions)
+
+    hb = sub.add_parser("heartbeat", help="Bump session last_seen_at")
+    hb.add_argument("session_id")
+    hb.add_argument("--json", action="store_true")
+    hb.set_defaults(func=cmd_heartbeat)
+
+    wi = sub.add_parser("whois", help="Human-readable session summary")
+    wi.add_argument("session_id")
+    wi.add_argument("--json", action="store_true")
+    wi.set_defaults(func=cmd_whois)
+
+    wt = sub.add_parser("who-touched", help="Show recent operations for a file/resource")
+    wt.add_argument("path")
+    wt.add_argument("--limit", type=int, default=RECENT_LIMIT)
+    wt.add_argument("--json", action="store_true")
+    wt.set_defaults(func=cmd_who_touched)
+
+    oc = sub.add_parser("op-chain", help="Show operation chain for a file/resource")
+    oc.add_argument("path")
+    oc.add_argument("--limit", type=int, default=50)
+    oc.add_argument("--json", action="store_true")
+    oc.set_defaults(func=cmd_op_chain)
+
+    rate = sub.add_parser("rate", help="Rate a trace operation")
+    rate.add_argument("trace_id")
+    rate.add_argument("score", choices=["good", "bad", "uncertain"])
+    rate.add_argument("comment", nargs="*")
+    rate.set_defaults(func=cmd_rate)
+
+    doctor = sub.add_parser("doctor", help="Verify installation")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(func=cmd_doctor)
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    global DEFAULT_DATA_DIR
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "data_dir", None):
+        DEFAULT_DATA_DIR = Path(args.data_dir).expanduser()
+    try:
+        return int(args.func(args))
+    except BrokenPipeError:
+        return 0
+    except Exception as exc:
+        append_log({"level": "error", "event": "cli_exception", "error": repr(exc)})
+        print(f"aids error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

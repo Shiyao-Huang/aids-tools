@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aids.local/schemas/post-tool-use-output.schema.json",
+  "title": "AIDS PostToolUse Output",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "phase",
+    "recorded",
+    "trace_ids",
+    "warnings",
+    "errors"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "selftools.hook.v1"
+    },
+    "phase": {
+      "const": "post_tool_use"
+    },
+    "recorded": {
+      "type": "boolean"
+    },
+    "trace_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "trace_records": {
+      "type": "array",
+      "items": {
+        "$ref": "trace-record.schema.json"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "additional_context": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

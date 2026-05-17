@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aids.local/schemas/session-record.schema.json",
+  "title": "AIDS SessionRecord",
+  "type": "object",
+  "required": [
+    "session_id",
+    "role",
+    "last_seen_at"
+  ],
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runtime": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "bash",
+        "unknown"
+      ]
+    },
+    "role": {
+      "type": "string"
+    },
+    "display_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "team_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "goal": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "project_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "started_at": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "last_seen_at": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "idle",
+        "retired",
+        "archived",
+        "unknown"
+      ]
+    },
+    "actor_type": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "human",
+        "bash",
+        "system",
+        "unknown"
+      ]
+    },
+    "aid_session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Legacy AID_SESSION_ID migration alias when different from session_id."
+    },
+    "aids_session_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "AIDS_SESSION_ID alias when different from session_id."
+    }
+  },
+  "additionalProperties": true
+}

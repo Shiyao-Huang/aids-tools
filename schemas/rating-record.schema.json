@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aids.local/schemas/rating-record.schema.json",
+  "title": "AIDS RatingRecord",
+  "type": "object",
+  "required": [
+    "rating_id",
+    "trace_id",
+    "rater_session_id",
+    "score",
+    "timestamp"
+  ],
+  "properties": {
+    "rating_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rater_session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "score": {
+      "type": "string",
+      "enum": [
+        "good",
+        "bad",
+        "uncertain"
+      ]
+    },
+    "comment": {
+      "type": "string"
+    },
+    "context": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "timestamp_iso": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "runtime": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "claude",
+        "codex",
+        "bash",
+        "unknown",
+        null
+      ]
+    },
+    "rater_actor_type": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "agent",
+        "human",
+        "bash",
+        "system",
+        "unknown",
+        null
+      ]
+    }
+  },
+  "additionalProperties": true
+}

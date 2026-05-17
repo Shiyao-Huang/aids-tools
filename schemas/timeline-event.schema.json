@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aids.local/schemas/timeline-event.schema.json",
+  "title": "AIDS TimelineEvent",
+  "description": "Append-only event in ~/.aids/timeline/YYYY-MM-DD.jsonl. Represents any Claude Code, Codex, or Bash operation using the unified ToolEnvelope contract.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event_id",
+    "timestamp",
+    "actor_type",
+    "runtime",
+    "session_id",
+    "tool",
+    "resource",
+    "intent"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "aids.timeline.v1"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "trace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent_trace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "timestamp_iso": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor_type": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "human",
+        "bash",
+        "system",
+        "unknown"
+      ]
+    },
+    "runtime": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "bash",
+        "unknown"
+      ]
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool": {
+      "type": "string",
+      "minLength": 1
+    },
+    "resource": {
+      "type": "string",
+      "minLength": 1
+    },
+    "intent": {
+      "type": "string"
+    },
+    "operation": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result": {
+      "type": [
+        "object",
+        "string",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "ratings": {
+      "type": "array",
+      "items": {
+        "$ref": "rating-record.schema.json"
+      }
+    },
+    "native": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

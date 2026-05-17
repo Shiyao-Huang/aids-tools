@@ -1,0 +1,18 @@
+# Agent runtime files
+.aha/
+.genome/
+
+# Data directories (created at runtime)
+.aids/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/

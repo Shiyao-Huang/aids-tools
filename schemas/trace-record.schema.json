@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aids.local/schemas/trace-record.schema.json",
+  "title": "AIDS TraceRecord",
+  "type": "object",
+  "required": [
+    "trace_id",
+    "session_id",
+    "tool",
+    "resource_path",
+    "operation",
+    "intent",
+    "timestamp"
+  ],
+  "properties": {
+    "trace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tool": {
+      "type": "string"
+    },
+    "resource_path": {
+      "type": "string"
+    },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "create",
+        "read",
+        "modify",
+        "delete",
+        "execute",
+        "touch",
+        "unknown"
+      ]
+    },
+    "intent": {
+      "type": "string"
+    },
+    "pre_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "post_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "duration_ms": {
+      "type": [
+        "number",
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "timestamp_iso": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "team_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "ratings_summary": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "runtime": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "bash",
+        "unknown"
+      ]
+    },
+    "actor_type": {
+      "type": "string",
+      "enum": [
+        "agent",
+        "human",
+        "bash",
+        "system",
+        "unknown"
+      ]
+    },
+    "parent_trace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result": {
+      "type": [
+        "object",
+        "string",
+        "null"
+      ],
+      "additionalProperties": true
+    },
+    "timeline_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": true
+}

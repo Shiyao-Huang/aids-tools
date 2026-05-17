@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export AIDS_RUNTIME="claude"
+export SELFTOOLS_RUNTIME="${SELFTOOLS_RUNTIME:-claude}"
+export AIDS_SESSION_ID="${AIDS_SESSION_ID:-${AID_SESSION_ID:-${ZHUYI_SESSION_ID:-claude-$(date +%Y%m%d%H%M%S)-$$}}}"
+export AID_SESSION_ID="${AID_SESSION_ID:-$AIDS_SESSION_ID}"
+export ZHUYI_SESSION_ID="${ZHUYI_SESSION_ID:-$AIDS_SESSION_ID}"
+export SELFTOOLS_SESSION_ID="$AIDS_SESSION_ID"
+export AIDS_DATA_DIR="${AIDS_DATA_DIR:-${AIDS_HOME:-${AID_DATA_DIR:-${AID_HOME:-$HOME/.aids}}}}"
+export AIDS_HOME="$AIDS_DATA_DIR"
+export AID_DATA_DIR="${AID_DATA_DIR:-$AIDS_DATA_DIR}"
+export AID_HOME="$AIDS_DATA_DIR"
+export ZHUYI_DATA_DIR="${ZHUYI_DATA_DIR:-$AIDS_DATA_DIR}"
+export SELFTOOLS_DATA_DIR="${SELFTOOLS_DATA_DIR:-$AIDS_DATA_DIR}"
+if ! command -v claude >/dev/null 2>&1; then
+  echo "claude binary not found on PATH" >&2
+  exit 127
+fi
+exec claude "$@"
