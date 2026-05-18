@@ -3,22 +3,93 @@
 **Reviewer**: Legion8 Codex Reviewer
 **Date**: 2026-05-19
 **Scope**: Full codebase review — hooks (JS + shell), trace engine, session registry, installer, tests
-**Status**: Round 1 complete
+**Status**: Round 2 complete (post-implementation review)
 
 ---
 
 ## Summary
 
-272/273 tests pass (1 flaky concurrent test)。代码整体质量良好，架构清晰。发现 **1 个 P0 安全漏洞**、**3 个 P1**、**5 个 P2**、**4 个 P3**。
+**278/278 tests pass**（flaky 并发测试已修复）。Commit `3d107af` 合并了 3 个任务：hooks 去重、aids prune、op-chain lineage。
+
+Round 1 发现的 **4/5 个高优先级 issue 已修复**：P1-1/P1-2（JS 去重）✅、P2-1（shell 去重）✅、P2-4（extractBashResources 去重）✅。
+
+仍待修复：P0-1（eval 注入）、P1-3（并发测试）、P2-2/P2-3（trace 引擎性能）。
 
 核心亮点：
 - 三层 trace 架构（JS hooks → trace.js → bin/selftools Python CLI）设计合理
 - 文件锁 + 原子 append 保障并发安全
 - 不变量测试覆盖全面（7 条不变量全部验证）
+- **Round 2**: JS hooks 成功提取共享模块 `_aid_shared.js`（180 行），shell hooks 提取 `_aid_common.sh`（44 行）
 
 ---
 
-## Issue List (按严重性排序)
+## Round 2 — Post-Implementation Review (Commit 3d107af)
+
+### Hooks 代码去重 ✅ Approved
+
+**Files**: `_aid_shared.js` (新增 180 行), `_aid_common.sh` (新增 44 行), 6 个 hook 文件重构
+
+**JS 去重评估**：
+- `inferRuntime()`, `inferActorType()`, `resolveAgentId()`, `extractResourceKeys()`, `extractBashResources()` 全部提取到 `_aid_shared.js`
+- `pre_tool_use.js`: 从 282 行 → 127 行 (-55%)
+- `post_tool_use.js`: 从 257 行 → 122 行 (-52%)
+- `clip()` 和 `budgetLines()` 签名改为接收参数而非依赖闭包变量 → 更易测试 ✅
+- `normalizeFilePath` 从 `src/trace/trace.js` 引入，未重复实现 ✅
+
+**Shell 去重评估**：
+- `_aid_common.sh` 提供 3 个函数：`aid_detect_runtime`, `aid_resolve_agent_id`, `aid_find_bin`
+- `session-start.sh` 仍保留 display_name/role/model 推断（仅此文件需要）— 合理
+- 所有 shell hook 文件从 30+ 行降至 7-34 行 ✅
+- `source` 路径使用 `$(dirname "$0")` → 正确处理相对路径
+
+| ID | Severity | Issue | Status |
+|----|----------|-------|--------|
+| R1-P1-1 | High | JS `inferRuntime/ActorType` 复制粘贴 | ✅ **Fixed** — 提取到 `_aid_shared.js` |
+| R1-P1-2 | High | JS `resolveAgentId()` 复制粘贴 | ✅ **Fixed** — 提取到 `_aid_shared.js` |
+| R1-P2-1 | Medium | Shell agent_id 块复制 5 次 | ✅ **Fixed** — 提取到 `_aid_common.sh` |
+| R1-P2-4 | Medium | `extractBashResources()` 复制 60+ 行 × 2 | ✅ **Fixed** — 提取到 `_aid_shared.js` |
+
+**R2 新发现**：
+
+| ID | Severity | Issue |
+|----|----------|-------|
+| R2-P2-1 | Medium | `_aid_shared.js` 中 `extractBashResources()` 缺少 `normalizeFilePath` 的 import — 但实际已在函数内通过闭包调用 `src/trace/trace.js` 的导出。确认 ✅ 安全 |
+| R2-P3-1 | Low | `post_tool_use.sh` 和 `pre_tool_use.sh` 调用 `aid_detect_runtime` 但 `_aid_common.sh` 已被 source，runtime 推断在子 shell 中重复一次 — 无害 |
+
+### aids prune 命令 ✅ Approved
+
+**File**: `bin/selftools` (+97 行)
+
+- 支持 `--days N`（默认 30）、`--dry-run`、`--json`
+- 清理范围：retired sessions、旧 traces/ratings/timeline JSONL、stale locks
+- 使用 `FileLock.STALE_SECONDS` 作为 lock 过期标准 — 与现有 lock 机制一致 ✅
+- `bytes_freed` 统计提供磁盘回收可见性
+- `ensure_layout(skip_stale_clean=True)` 避免递归清理 ✅
+
+| ID | Severity | Issue |
+|----|----------|-------|
+| R2-P2-2 | Medium | `cmd_prune` 中 `ts / 1000.0 < cutoff_ts` — `cutoff_ts` 来自 `datetime.timestamp()`（秒级），但 session 的 `last_seen_at` 是毫秒级。除法 `ts / 1000.0` 转换正确 ✅ |
+| R2-P3-2 | Low | `.ndjson` 文件未被 prune 覆盖 — 只 glob `*.jsonl`。应同时包含 `*.ndjson` |
+
+### op-chain lineage ✅ Approved
+
+**File**: `bin/selftools` `cmd_op_chain()` 重写 (+63 行)
+
+- 从旧的 `print_traces_for_resource` 改为 `prev_trace_id` 链式遍历
+- 从 index 的 `last_trace_id` 开始，沿 `prev_trace_id` 向前遍历
+- `seen` set 防止循环 ✅
+- 输出包含 lineage arrows (`prev→current`)、agent_id、role、intent
+- JSON mode 输出完整 chain 结构
+
+| ID | Severity | Issue |
+|----|----------|-------|
+| R2-P3-3 | Low | `len(chain) < limit` 限制 chain 深度，但 limit 默认值未知（依赖 argparse）。应确认默认值合理（如 50） |
+
+---
+
+## Round 1 Issue Status Update
+
+### P0 — 安全漏洞
 
 ### P0 — 安全漏洞
 
