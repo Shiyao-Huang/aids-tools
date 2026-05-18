@@ -41,14 +41,23 @@ graph TB
         direction TB
         SR["Session Registry\n~/.aids/sessions/"]
         TS["Trace Store\n~/.aids/traces/"]
+        TL["Timeline\n~/.aids/timeline/"]
         RL["Rating Layer\n~/.aids/ratings/"]
         IDX["Resource Index\n~/.aids/index/"]
+        CG["Code Graph\n~/.aids/codegraph/"]
+        LK["File Locks\n~/.aids/locks/"]
+        PD["Pending Ops\n~/.aids/pending/"]
+        LG["Debug Logs\n~/.aids/logs/"]
     end
 
     subgraph QueryAPI["Query Interface"]
         QR["who-touched? <path>"]
         QS["session-info <id>"]
         QC["op-chain <path>"]
+        QI["impact <path>"]
+        QX["export"]
+        QV["verify"]
+        QStat["stats"]
     end
 
     CC -->|"tool call JSON"| PRE
@@ -218,13 +227,25 @@ graph LR
 ~/.aids/                           # Global store (cross-project)
 ├── sessions/
 │   └── {session_id}.json         # SessionRecord
+│   └── .current                  # Symlink → active session
+│   └── .identity                 # Plain-text quick-read
 ├── traces/
-│   └── YYYY-MM-DD.jsonl          # TraceRecord (append-only)
+│   └── YYYY-MM-DD.jsonl          # TraceRecord (append-only, hash-chained)
+├── timeline/
+│   └── YYYY-MM-DD.jsonl          # Timeline events (batch writes)
 ├── index/
 │   └── {base64_path}.json        # [trace_id...] per resource
 ├── ratings/
-│   └── YYYY-MM-DD.jsonl          # RatingRecord (append-only)
-└── config.json                   # Global config
+│   └── YYYY-MM-DD.jsonl          # RatingRecord (append-only, INV-7 dedup)
+├── codegraph/
+│   └── {root_hash}.json          # Cached AST code graph per project root
+├── locks/
+│   └── {resource_key}.lock       # File-based locks with stale detection
+├── pending/
+│   └── {session_id}.json         # PreToolUse pending operations
+├── logs/
+│   └── YYYY-MM-DD.jsonl          # Debug/audit log
+└── config.json                   # Global config (protected keys)
 
 aids-tools/                       # This project (implementation; current checkout may be selftools)
 ├── docs/
@@ -258,6 +279,97 @@ aids-tools/                       # This project (implementation; current checko
 ---
 
 ## Key Design Decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Trace storage | Append-only JSONL | Zero deps, grep-able, survives crashes |
+| Resource index | Per-file JSON array | O(1) lookup, fits in RAM |
+| Hook delivery (Claude) | settings.json preToolUse/postToolUse | Official API, survives upgrades |
+| Hook delivery (Codex) | PATH shim wrapper | No native hook API yet |
+| Session identity | ENV var `AIDS_SESSION_ID` | Available to hooks without file I/O |
+| Intent capture | From `AIDS_INTENT` ENV or task comment | Declared, not inferred |
+| Rating storage | Separate JSONL from traces | Ratings arrive after the fact |
+| Install surface | `~/.aids/` global | Cross-project awareness |
+| Tool coverage | Write + Read + Edit + Bash | All four native tools intercepted |
+| Plugin pattern | settings.json hooks (Claude) + PATH shim (Codex) | Like superpower / claude-for-codex |
+| Schema versioning | `selftools.hook.v1` | Machine-checkable contract for all runtimes |
+| Code graph | Built-in AST analysis + cached JSON | Zero deps, replaces external GitNexus |
+| Hash chain | SHA256(prev_hash + trace fields) | Tamper-proof, self-verifying |
+| Protected config | Immutable keys (signature, hash_chain) | Agents cannot disable security features |
+
+---
+
+## New Modules
+
+### Session-Start Identity Inference
+
+On `SessionStart` hook, AIDS automatically infers agent identity from a cascade of environment variables:
+
+```
+session_id ← AIDS_SESSION_ID → AID_SESSION_ID → SESSION_ID → AHA_SESSION_ID
+role       ← AIDS_ROLE → AHA_AGENT_ROLE → ROLE
+runtime    ← AIDS_RUNTIME or detected from transcript_path (.claude / .codex)
+display    ← AIDS_DISPLAY_NAME → AHA_SESSION_NAME
+goal       ← AIDS_INTENT → AHA_INTENT → AHA_AGENT_SCOPE_SUMMARY
+```
+
+If no env vars are set, falls back to `local-{hostname}-{pid}`. The `agent_id` is a deterministic SHA256 of `display_name + role + team_id`, stable across session restarts.
+
+Three self-reference files are written:
+- `~/.aids/.identity` — plain-text quick-read
+- `~/.aids/sessions/.current` — symlink to active session JSON
+- `.claude/AIDS_IDENTITY.md` — injected into Claude's context
+
+### Hook Output Contract
+
+Hooks output a dual-format JSON for cross-runtime compatibility:
+
+```json
+{
+  "systemMessage": "Human-readable awareness context",
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "additionalContext": "Structured context for agent"
+  }
+}
+```
+
+Supported events: `SessionStart`, `PreToolUse`, `PostToolUse`.
+
+### Code Graph (Built-in Impact Analysis)
+
+AIDS includes a built-in code graph analyzer that replaces external GitNexus:
+
+- **AST parsing**: Python and JS/TS files are parsed to extract imports, exports, and references
+- **Cached graphs**: Stored in `~/.aids/codegraph/{root_hash}.json`, auto-refreshed on file changes
+- **Impact query**: `aids impact <path>` shows dependents, dependencies, importance, and risk
+- **Hook integration**: PreToolUse automatically shows code graph importance for write operations
+
+### Hash Chain
+
+Every trace carries a `chain_hash` — SHA256 of the previous hash + current trace's key fields:
+
+```
+GENESIS → tr_a1b2 (chain_hash: a3f8...) → tr_a1b3 (chain_hash: 7e2c...) → ...
+```
+
+Tamper with any entry, and all subsequent hashes break. Verify with `aids verify`.
+
+### File Locks
+
+Cross-platform file locks with stale detection:
+
+- Stored in `~/.aids/locks/`
+- PID-based stale detection (5-minute timeout)
+- `fcntl.flock` on Unix, `os.rename()` atomic fallback on Windows
+- Path traversal prevention (locks must live under `~/.aids/locks/`)
+
+### Stats & Export
+
+- **`aids stats`**: Aggregate dashboard — sessions by runtime, trace counts by operation, unique resources, ratings
+- **`aids export`**: Export traces as JSONL, CSV, or JSON for external analysis
+
+## Key Design Decisions (Legacy)
 
 | Decision | Choice | Rationale |
 |---|---|---|

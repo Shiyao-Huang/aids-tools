@@ -256,18 +256,24 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 class FileLock:
-    """File-based lock with stale detection, timeout, and cross-platform support.
+    """File-based lock with stale detection, TTL expiry, and cross-platform support.
 
     Lock files store PID + timestamp for stale-holder detection.
     Uses fcntl.flock on Unix; os.rename() atomicity as pseudo-lock on non-fcntl.
     Validates lock paths reside under ~/.aids/locks/ to prevent traversal.
+
+    TTL (Time-To-Live): locks older than *DEFAULT_TTL* seconds are considered
+    expired and automatically broken, even if the holder PID is still alive
+    (protects against hung / zombie holders).
     """
 
-    STALE_SECONDS = 300  # 5 minutes
+    STALE_SECONDS = 300  # 5 minutes — used by clean_all_stale_locks()
+    DEFAULT_TTL = 30     # 30 seconds — lock expiry timeout
 
-    def __init__(self, path: Path, timeout: float = 5.0):
+    def __init__(self, path: Path, timeout: float = 5.0, ttl: float = 30.0):
         self.path = Path(path)
         self.timeout = timeout
+        self.ttl = ttl
         self.fd: Optional[Any] = None
         self._owns_lock: bool = False
 
@@ -313,9 +319,15 @@ class FileLock:
             self.fd.flush()
 
     def _break_stale_lock(self) -> bool:
-        """Remove lock file if the holder process is dead.
+        """Remove lock file if the holder process is dead OR the lock has expired.
 
-        Returns True if the lock was stale (or absent), False if holder is alive.
+        A lock is considered stale when:
+        1. The lock file is absent / unreadable, OR
+        2. The holder PID is dead, OR
+        3. The lock is older than *self.ttl* seconds (TTL expiry).
+
+        Returns True if the lock was stale (or absent), False if holder is alive
+        and lock is within TTL.
         """
         info = self._read_lock_info()
         if info is None:
@@ -323,6 +335,16 @@ class FileLock:
         pid = info.get("pid")
         if not isinstance(pid, int) or pid <= 0:
             return True
+        # TTL-based expiry: break locks older than ttl seconds
+        ts = info.get("ts")
+        if isinstance(ts, (int, float)) and ts > 0:
+            age_ms = now_ms() - ts
+            if age_ms > self.ttl * 1000:
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+                return True
         if not self._is_pid_alive(pid):
             try:
                 self.path.unlink()
@@ -330,6 +352,16 @@ class FileLock:
                 pass
             return True
         return False
+
+    def _is_lock_expired(self) -> bool:
+        """Check whether the current lock file has exceeded its TTL."""
+        info = self._read_lock_info()
+        if info is None:
+            return True
+        ts = info.get("ts")
+        if isinstance(ts, (int, float)) and ts > 0:
+            return (now_ms() - ts) > self.ttl * 1000
+        return True  # no timestamp = expired
 
     def _clean_stale_mtime(self) -> None:
         """Fallback: remove lock files older than STALE_SECONDS (mtime-based)."""
@@ -416,29 +448,21 @@ class FileLock:
         self._validate_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        if fcntl is not None:
-            # PID-based stale check, then mtime fallback, then blocking flock.
+        deadline = time.monotonic() + self.timeout
+        while True:
             self._break_stale_lock()
             self._clean_stale_mtime()
-            self.fd = open(self.path, "a+", encoding="utf-8")
-            fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
-            self._owns_lock = True
-            self._write_lock_info()
-        else:
-            # Windows / non-fcntl: retry with stale detection up to self.timeout.
-            deadline = time.monotonic() + self.timeout
-            while True:
-                self._break_stale_lock()
-                self._clean_stale_mtime()
-                if self._try_acquire_rename():
+            if self._try_acquire_nb():
+                return self
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # One last attempt after stale-break
+                if self._break_stale_lock() and self._try_acquire_nb():
                     return self
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"Lock {self.path} not acquired within {self.timeout}s"
-                    )
-                time.sleep(0.05)
-
-        return self
+                raise TimeoutError(
+                    f"Lock {self.path} not acquired within {self.timeout}s"
+                )
+            time.sleep(min(0.05, remaining))
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         """Release lock, close fd; safe to call even after prior errors."""
@@ -1180,6 +1204,20 @@ def hook_output(event_name: str, message: str, *, post: bool = False) -> None:
     print(json_line(out))
 
 
+def identity_lines(session: Dict[str, Any]) -> List[str]:
+    display = session.get("display_name") or session.get("session_id") or "unknown"
+    role = session.get("role") or "unknown"
+    runtime = session.get("runtime") or "unknown"
+    model = session.get("model") or "unknown"
+    agent_id = session.get("agent_id") or "unknown"
+    session_id = session.get("session_id") or "unknown"
+    return [
+        f"identity={display} role={role} runtime={runtime} model={model}",
+        f"agent_id={agent_id}",
+        f"session_id={session_id}",
+    ]
+
+
 def cmd_hook_session_start(_: argparse.Namespace) -> int:
     event = read_stdin_json()
     session = register_session(event, source="session-start")
@@ -1213,11 +1251,13 @@ def cmd_hook_session_start(_: argparse.Namespace) -> int:
     # ── Enriched SessionStart message with identity template ──
     role = session.get('role') or 'unknown'
     runtime = session.get('runtime') or 'unknown'
+    model = session.get('model') or 'unknown'
     display = session.get('display_name') or session['session_id']
     goal = short(session.get('goal'), 120) or '(none)'
     message = (
         f"{ZH_NAME} session registered.\n"
-        f"You are {display} (role={role}, runtime={runtime}).\n"
+        f"You are {display} (role={role}, runtime={runtime}, model={model}).\n"
+        f"agent_id={session.get('agent_id') or 'unknown'}\n"
         f"session_id={session['session_id']}\n"
         f"goal={goal}\n"
         f"Use `aids who-touched <path>` or `aids op-chain <path>` before risky edits."
@@ -1337,7 +1377,11 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
     append_jsonl_multi(timeline_file_for_today(), timeline_events)
     remove_pending(event)
     if trace_ids:
-        hook_output("PostToolUse", f"{ZH_NAME} recorded {len(trace_ids)} trace(s): {', '.join(trace_ids)}", post=True)
+        message = (
+            f"{ZH_NAME} recorded {len(trace_ids)} trace(s): {', '.join(trace_ids)}\n"
+            + "\n".join(identity_lines(session))
+        )
+        hook_output("PostToolUse", message, post=True)
     return 0
 
 
@@ -2130,6 +2174,8 @@ def _compact_trace(trace: Dict[str, Any], intent_max: int = 80) -> Dict[str, Any
         "tool": trace.get("tool"),
         "session_id": trace.get("session_id") or trace.get("sessionId"),
         "agent_id": trace.get("agent_id"),
+        "display_name": trace.get("display_name"),
+        "model": trace.get("model"),
         "role": trace.get("role"),
         "runtime": trace.get("runtime"),
         "resource_path": trace.get("resource_path") or trace.get("filePath"),
@@ -2464,17 +2510,26 @@ def cmd_stats(args: argparse.Namespace) -> int:
             filtered.append(s)
         sessions = filtered
 
+    by_agent = getattr(args, "by_agent", False)
     sess_total = len(sessions)
     sess_by_status: Dict[str, int] = {}
     sess_by_runtime: Dict[str, int] = {}
     sess_by_role: Dict[str, int] = {}
+    sess_by_agent: Dict[str, int] = {}
+    sid_to_agent: Dict[str, str] = {}
     for s in sessions:
         st = s.get("status") or "unknown"
         rt = s.get("runtime") or "unknown"
         rl = s.get("role") or "unknown"
+        aid = s.get("agent_id") or compute_agent_id(
+            s.get("display_name", ""), s.get("role", ""), s.get("team_id")
+        )
         sess_by_status[st] = sess_by_status.get(st, 0) + 1
         sess_by_runtime[rt] = sess_by_runtime.get(rt, 0) + 1
         sess_by_role[rl] = sess_by_role.get(rl, 0) + 1
+        if by_agent:
+            sess_by_agent[aid] = sess_by_agent.get(aid, 0) + 1
+            sid_to_agent[s.get("session_id", "")] = aid
 
     # ── Traces ──
     trace_files = _jsonl_files_in_range(dd / "traces", date_from, date_to)
@@ -2482,6 +2537,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
     op_counts: Dict[str, int] = {}
     trace_by_session: Dict[str, int] = {}
     trace_by_runtime: Dict[str, int] = {}
+    trace_by_agent: Dict[str, int] = {}
     resource_counts: Dict[str, int] = {}
     for tr in _iter_jsonl_lines(trace_files):
         trace_count += 1
@@ -2493,6 +2549,9 @@ def cmd_stats(args: argparse.Namespace) -> int:
         trace_by_runtime[rt] = trace_by_runtime.get(rt, 0) + 1
         res = tr.get("resource_path") or "unknown"
         resource_counts[res] = resource_counts.get(res, 0) + 1
+        if by_agent:
+            t_aid = sid_to_agent.get(sid) or tr.get("agent_id") or "unknown"
+            trace_by_agent[t_aid] = trace_by_agent.get(t_aid, 0) + 1
 
     # ── Timeline ──
     tl_files = _jsonl_files_in_range(dd / "timeline", date_from, date_to)
@@ -3104,8 +3163,36 @@ def cmd_impact(args: argparse.Namespace) -> int:
     # Git log
     git_entries = _fallback_git_log(file_path, cwd, count=5)
 
-    # AIDS traces for this file
-    traces = recent_traces(file_path, limit=10)
+    # AIDS traces for this file (fetch more for session analysis)
+    traces = recent_traces(file_path, limit=50)
+
+    # ── Session impact: unique sessions that modified/touched this resource ──
+    session_map: Dict[str, Dict[str, Any]] = {}
+    for t in traces:
+        sid = str(t.get("session_id") or "")
+        if not sid or sid in session_map:
+            continue
+        sess = t.get("session") or {}
+        session_map[sid] = {
+            "session_id": sid,
+            "agent_id": sess.get("agent_id") or t.get("agent_id") or "unknown",
+            "display_name": sess.get("display_name") or sid[:12],
+            "role": sess.get("role") or "unknown",
+            "runtime": sess.get("runtime") or "unknown",
+        }
+    # Count operations per session
+    session_op_counts: Dict[str, Dict[str, int]] = {}
+    for t in traces:
+        sid = str(t.get("session_id") or "")
+        if sid not in session_op_counts:
+            session_op_counts[sid] = {}
+        op = t.get("operation") or "unknown"
+        session_op_counts[sid][op] = session_op_counts[sid].get(op, 0) + 1
+    session_impact = []
+    for sid, info in session_map.items():
+        info["operation_counts"] = session_op_counts.get(sid, {})
+        info["total_ops"] = sum(session_op_counts.get(sid, {}).values())
+        session_impact.append(info)
 
     # Importance: upgrade if gitnexus or heuristic suggests higher
     heuristic = _compute_importance(dependents, git_entries, traces)
@@ -3125,6 +3212,8 @@ def cmd_impact(args: argparse.Namespace) -> int:
         "dependents": dependents[:20],
         "dependencies": dependencies[:20],
         "recent_git_changes": git_entries,
+        "session_impact": session_impact,
+        "unique_sessions": len(session_impact),
         "recent_traces": [
             {
                 "trace_id": t.get("trace_id"),
@@ -3134,7 +3223,7 @@ def cmd_impact(args: argparse.Namespace) -> int:
                 "intent": t.get("intent"),
                 "ago": human_ago(t.get("timestamp", 0)) if isinstance(t.get("timestamp"), int) else "unknown",
             }
-            for t in traces
+            for t in traces[:10]
         ],
         "dependent_count": len(dependents),
         "dependency_count": len(dependencies),
@@ -3155,9 +3244,27 @@ def cmd_impact(args: argparse.Namespace) -> int:
 
     # Human-readable
     print(f"File Impact Analysis: {file_path}")
-    print(f"  Importance: {importance.upper()}")
+    print(f"  Importance: {_bold(importance.upper())}")
     print(f"  Risk:       {result['risk_note']}")
+    print(f"  Agents:     {len(session_impact)} unique session(s) touched this file")
     print()
+
+    # ── Session impact section ──
+    if session_impact:
+        print(f"  {_bold('Modified by')} ({len(session_impact)} agents):")
+        for si in session_impact[:10]:
+            name = si.get("display_name", "?")
+            role = si.get("role", "?")
+            runtime = si.get("runtime", "?")
+            agent_id = si.get("agent_id", "?")
+            ops = si.get("total_ops", 0)
+            op_detail = ", ".join(f"{k}:{v}" for k, v in sorted(si.get("operation_counts", {}).items()))
+            print(f"    {_cyan(name)} ({role}/{runtime}) agent_id={agent_id}")
+            if op_detail:
+                print(f"      operations: {op_detail} ({ops} total)")
+        if len(session_impact) > 10:
+            print(f"    ... and {len(session_impact) - 10} more")
+        print()
 
     if gn and gn.get("available"):
         print(f"  GitNexus: {short(gn.get('summary', ''), 200)}")
@@ -3213,13 +3320,72 @@ def cmd_impact(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_commit_stamp(_: argparse.Namespace) -> int:
-    """Output git Co-Authored-By trailer with current session identity."""
+def cmd_commit_stamp(args: argparse.Namespace) -> int:
+    """Output git commit trailer with session identity and AIDS trace summary.
+
+    Generates a Co-Authored-By trailer plus an AIDS trace summary showing
+    recent activity (trace count, unique resources, chain verification status).
+    """
     sid = current_session_id() or "unknown"
     role = env_first("AIDS_ROLE", "AID_ROLE", "AHA_AGENT_ROLE", "ROLE", "SELFTOOLS_ROLE", "ZHUYI_ROLE", "AHA_ROLE") or "developer"
     name = env_first("AIDS_DISPLAY_NAME", "AHA_SESSION_NAME", "AID_DISPLAY_NAME", "SELFTOOLS_DISPLAY_NAME", "ZHUYI_DISPLAY_NAME") or sid[:12]
     runtime = env_first("AIDS_RUNTIME", "AID_RUNTIME", "SELFTOOLS_RUNTIME", "ZHUYI_RUNTIME") or "unknown"
-    print(f"Co-Authored-By: {name} ({role}/{runtime}) <aids:{sid}@agent>")
+    as_json = getattr(args, "json", False)
+
+    # Collect trace summary from today's traces
+    ensure_layout()
+    trace_count = 0
+    resources: set = set()
+    last_trace_id: Optional[str] = None
+    has_chain_hash = False
+    traces_dir = data_dir() / "traces"
+    if traces_dir.exists():
+        today_file = traces_dir / f"{today()}.jsonl"
+        if today_file.exists():
+            try:
+                for line in today_file.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        tr = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if tr.get("session_id") == sid:
+                        trace_count += 1
+                        res = tr.get("resource_path")
+                        if res:
+                            resources.add(res)
+                        if tr.get("chain_hash"):
+                            has_chain_hash = True
+                        last_trace_id = tr.get("trace_id")
+            except OSError:
+                pass
+
+    trailer = f"Co-Authored-By: {name} ({role}/{runtime}) <aids:{sid}@agent>"
+
+    if as_json:
+        result = {
+            "trailer": trailer,
+            "session_id": sid,
+            "display_name": name,
+            "role": role,
+            "runtime": runtime,
+            "trace_summary": {
+                "trace_count": trace_count,
+                "unique_resources": len(resources),
+                "resources": sorted(resources) if len(resources) <= 10 else sorted(resources)[:10],
+                "last_trace_id": last_trace_id,
+                "chain_signed": has_chain_hash,
+            },
+        }
+        print(json_dump(result))
+    else:
+        print(trailer)
+        if trace_count > 0:
+            print(f"AIDS-Trace-Summary: {trace_count} ops, {len(resources)} resource(s), chain={'signed' if has_chain_hash else 'unsigned'}")
+            if last_trace_id:
+                print(f"AIDS-Last-Trace: {last_trace_id}")
     return 0
 
 
@@ -3447,8 +3613,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     lock_mech = "fcntl.flock" if fcntl is not None else "os.rename (portable)"
     checks.append(check("lock_mechanism", True, lock_mech))
     locks_dir = data_dir() / "locks"
-    stale_count = sum(1 for _ in locks_dir.glob("*.lock")) if locks_dir.exists() else 0
-    checks.append(check("stale_locks", stale_count == 0, f"{stale_count} lock files in {locks_dir}"))
+    lock_files = list(locks_dir.glob("*.lock")) if locks_dir.exists() else []
+    stale_locks = []
+    for lock_file in lock_files:
+        try:
+            info = json.loads(lock_file.read_text(encoding="utf-8").strip() or "{}")
+            pid = info.get("pid")
+            if isinstance(pid, int) and pid > 0 and FileLock._is_pid_alive(pid):
+                continue
+        except Exception:
+            pass
+        try:
+            if time.time() - lock_file.stat().st_mtime > FileLock.STALE_SECONDS:
+                stale_locks.append(lock_file)
+        except OSError:
+            stale_locks.append(lock_file)
+    checks.append(check("stale_locks", len(stale_locks) == 0, f"{len(stale_locks)} stale / {len(lock_files)} lock files in {locks_dir}"))
+    # ── Clean stale locks if requested ──
+    cleaned_count = 0
+    if getattr(args, "clean_locks", False) and stale_locks:
+        for lf in stale_locks:
+            try:
+                lf.unlink()
+                cleaned_count += 1
+            except OSError:
+                pass
+        checks.append(check("clean_locks", True, f"removed {cleaned_count}/{len(stale_locks)} stale lock files"))
     # ── config.json validity ──
     config_path = data_dir() / "config.json"
     config_ok = True
@@ -3598,6 +3788,7 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--all", action="store_true", dest="all", help="All time, ignore --days")
     stats.add_argument("--from", dest="from_date", help="Start date YYYY-MM-DD")
     stats.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD")
+    stats.add_argument("--by-agent", action="store_true", dest="by_agent", help="Aggregate by agent_id")
     stats.set_defaults(func=cmd_stats)
 
     export = sub.add_parser("export", help="Export AIDS data")
@@ -3622,6 +3813,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="Verify installation")
     doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--clean-locks", action="store_true", dest="clean_locks", help="Remove stale lock files")
     doctor.set_defaults(func=cmd_doctor)
 
     verify = sub.add_parser("verify", help="Verify trace integrity (chain hash + protected config)")

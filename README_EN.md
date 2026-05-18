@@ -273,6 +273,75 @@ Resources touched: 983 unique
 Ratings: 3 total (good: 3)
 ```
 
+### 🔌 Session-Start Identity Inference
+
+When a session starts (Claude Code, Codex, or Bash), AIDS automatically infers the agent's identity from environment variables — no manual registration needed:
+
+```bash
+# Auto-inferred on session-start hook:
+# - session_id ← AIDS_SESSION_ID (or AHA_SESSION_ID fallback chain)
+# - role       ← AIDS_ROLE / AHA_AGENT_ROLE / ROLE
+# - runtime    ← AIDS_RUNTIME or detected from transcript_path (.claude / .codex)
+# - display    ← AIDS_DISPLAY_NAME / AHA_SESSION_NAME
+# - goal       ← AIDS_INTENT / AHA_INTENT
+# - agent_id   ← deterministic hash(display_name + role + team_id), stable across restarts
+```
+
+The hook also writes three self-reference files:
+- `~/.aids/.identity` — plain-text quick-read of current session
+- `~/.aids/sessions/.current` — symlink to active session JSON
+- `.claude/AIDS_IDENTITY.md` — injected into Claude's context window
+
+**No setup needed. Just start working, and AIDS figures out who you are.**
+
+### 📡 Hook Output Contract
+
+AIDS hooks output a dual-format JSON that both Claude Code and Codex can consume:
+
+```json
+{
+  "systemMessage": "AIDS awareness for Write:\nYou are ... about to write.\n...",
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "additionalContext": "AIDS awareness for Write:\n..."
+  }
+}
+```
+
+- `systemMessage`: Human-readable context injected into the agent's awareness
+- `hookSpecificOutput`: Structured hook event with `hookEventName` + `additionalContext`
+- Works for `SessionStart`, `PreToolUse`, and `PostToolUse` events
+
+This dual format ensures compatibility across runtimes without runtime-specific code paths.
+
+### 💥 Impact Analysis (impact)
+
+See the full blast radius of changing a file — which sessions touched it, what they did, and the code graph dependencies:
+
+```bash
+$ aids impact config.json
+File Impact Analysis: config.json
+  Importance: HIGH
+  Risk:       HIGH RISK: 5 files depend on this. Changes have broad impact.
+  Agents:     3 unique session(s) touched this file
+
+  Modified by (3 agents):
+    Claude Architect (architect/claude) agent_id=agent-a1b2c3d4e5f6
+      operations: modify:2, read:1 (3 total)
+    Codex Impl #1 (implementer/codex) agent_id=agent-7f8a9b0c1d2e
+      operations: modify:1 (1 total)
+    bash-human (developer/bash) agent_id=agent-3a4b5c6d7e8f
+      operations: read:2 (2 total)
+
+  Dependents (5 files that import/reference this file):
+    - src/server.py
+    - src/config_loader.py
+    - tests/test_config.py
+    ...
+```
+
+**Before you change a file, know who else depends on it — and who's been here recently.**
+
 ### 🔗 Operation Chain (Hash Chain)
 
 Every trace carries a `chain_hash` — SHA256 of the previous hash + current trace's key fields. This forms a tamper-proof chain:
