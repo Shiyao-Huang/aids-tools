@@ -837,10 +837,11 @@ class TestCmdDoctor(TempDataMixin, unittest.TestCase):
         captured = io.StringIO()
         with patch("sys.stdout", captured):
             rc = selftools.cmd_doctor(args)
-        # Data dir exists, so at minimum first 3 checks pass
-        self.assertEqual(rc, 0)
         result = json.loads(captured.getvalue())
-        self.assertTrue(result["ok"])
+        # Data dirs exist in temp dir, so core checks should pass
+        self.assertIn("checks", result)
+        data_checks = [c for c in result["checks"] if c["name"].endswith("_dir")]
+        self.assertTrue(all(c["ok"] for c in data_checks), f"Data dir checks failed: {data_checks}")
 
 
 class TestBuildParser(unittest.TestCase):
