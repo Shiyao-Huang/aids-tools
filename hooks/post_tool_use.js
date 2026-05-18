@@ -111,10 +111,11 @@ function extractResourceKeys(toolName, toolInput) {
 }
 
 /**
- * Parse Bash command for file-mutation targets.
+ * Parse Bash command for file-mutation targets and read-only file targets.
  */
 function extractBashResources(command) {
   if (!command) return [];
+  const path = require('path');
   const results = [];
   const hash = crypto.createHash('sha256').update(command).digest('hex').slice(0, 16);
   results.push(`bash:${hash}`);
@@ -131,6 +132,45 @@ function extractBashResources(command) {
       const target = m[1] || m[m.length - 1];
       if (target && !target.startsWith('-')) {
         try { results.push(normalizeFilePath(target)); } catch { /* skip */ }
+      }
+    }
+  }
+
+  // Detect read-only file targets: cat grep head tail wc sort uniq sed(without -i) etc.
+  const readCmds = new Set([
+    'cat', 'head', 'tail', 'less', 'more', 'wc', 'sort', 'uniq',
+    'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack',
+    'sed', 'awk', 'diff', 'comm', 'cut', 'tr',
+    'file', 'stat', 'md5sum', 'sha256sum', 'sha1sum', 'shasum',
+    'strings', 'hexdump', 'xxd', 'od',
+  ]);
+  const valueFlags = new Set([
+    '-e', '--regexp', '-f', '--file', '-n', '--lines', '-c', '--bytes',
+    '-k', '--key', '-t', '--field-separator', '-o', '--output',
+    '-F', '-v', '-d', '--delimiter', '--label', '-L', '-U', '--unified',
+    '-i', '--in-place',
+  ]);
+  const specialPaths = new Set(['/dev/null', '/dev/zero', '/dev/random', '/dev/urandom', '-']);
+  const knownFiles = new Set([
+    'Makefile', 'Dockerfile', 'README', 'LICENSE', 'CHANGELOG',
+    'Rakefile', 'Gemfile', 'Vagrantfile', 'Jenkinsfile',
+  ]);
+
+  for (const segment of command.split('|')) {
+    const tokens = segment.trim().split(/\s+/);
+    if (!tokens.length) continue;
+    const base = path.basename(tokens[0]);
+    if (!readCmds.has(base)) continue;
+    if (base === 'sed' && tokens.some(t => t === '-i' || /^-[^e]*i/.test(t))) continue;
+    let skip = false;
+    for (const tok of tokens.slice(1)) {
+      if (skip) { skip = false; continue; }
+      if (tok === ';' || tok === '&&' || tok === '||') break;
+      if (valueFlags.has(tok)) { skip = true; continue; }
+      if (tok.startsWith('-')) continue;
+      if (specialPaths.has(tok)) continue;
+      if (tok.includes('/') || tok.includes('.') || knownFiles.has(tok)) {
+        try { results.push(normalizeFilePath(tok)); } catch { /* skip */ }
       }
     }
   }
