@@ -19,8 +19,10 @@
 const { resolve } = require('../lib/session');
 const { getRecentTraces, normalizeFilePath, TRACE_OPERATIONS } = require('../src/trace/trace');
 
-const WRITE_TOOLS = new Set(['Write', 'Edit']);
-const RECENT_OPS_LIMIT = 5;
+const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'apply_patch', 'ApplyPatch']);
+const RECENT_OPS_LIMIT = budgetInt('AIDS_RECENT_LIMIT', 3, 1, 20);
+const CONTEXT_LINE_BUDGET = budgetInt('AIDS_AWARENESS_LINES', 8, 3, 40);
+const CONTEXT_CHAR_BUDGET = budgetInt('AIDS_AWARENESS_CHARS', 140, 60, 500);
 
 // --- Read stdin, then process ---
 
@@ -164,7 +166,7 @@ function injectWriteContext(identity, resourceKey, runtime, actorType) {
     const who = `${t.role || 'unknown'}/${sid}`;
     const runt = t.runtime ? ` [${t.runtime}]` : '';
     const actor = t.actor_type ? ` (${t.actor_type})` : '';
-    const why = t.purpose ? ` — ${t.purpose}` : '';
+    const why = t.purpose ? ` — ${clip(t.purpose)}` : '';
     lines.push(`  • ${t.operation} by ${who}${runt}${actor}${why} (${ago})`);
   }
 
@@ -172,7 +174,7 @@ function injectWriteContext(identity, resourceKey, runtime, actorType) {
   lines.push('Verify your changes do not conflict with the above.');
   lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   lines.push('');
-  process.stderr.write(lines.join('\n'));
+  process.stderr.write(budgetLines(lines).join('\n'));
 }
 
 function injectBashContext(identity, command, runtime, actorType) {
@@ -181,6 +183,24 @@ function injectBashContext(identity, command, runtime, actorType) {
   process.stderr.write(
     `AIDS pre-bash | ${runtime}/${actorType} | ${identity.role}/${identity.session_id.slice(0, 8)} | ${short}\n`
   );
+}
+
+function budgetInt(name, fallback, min, max) {
+  const parsed = Number(process.env[name] || process.env[name.replace('AIDS_', 'AID_')] || fallback);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function clip(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (text.length <= CONTEXT_CHAR_BUDGET) return text;
+  return text.slice(0, CONTEXT_CHAR_BUDGET - 1).trimEnd() + '…';
+}
+
+function budgetLines(lines) {
+  if (lines.length <= CONTEXT_LINE_BUDGET) return lines;
+  const hidden = lines.length - CONTEXT_LINE_BUDGET + 1;
+  return lines.slice(0, CONTEXT_LINE_BUDGET - 1).concat(`  • ${hidden} context lines clipped; use aids trace/recent tools to expand.`);
 }
 
 function formatAgo(ts) {

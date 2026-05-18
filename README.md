@@ -174,6 +174,15 @@ AIDS 由一个 10-agent 团队（意识工具）协作建造：5 个 Claude + 5 
 
 这不是追溯。这是意识。
 
+## 和 AID 相互借鉴
+
+AIDS 借鉴 AID 的两个默认策略：
+
+- **上下文预算**：hook 注入默认短上下文，越近越重要，风险和信噪比更高的内容优先；可用 `AIDS_AWARENESS_LINES` / `AIDS_AWARENESS_CHARS` 调整。
+- **所有重要工具都留痕**：不只 `Read/Write/Edit/Bash`，`WebFetch`、`WebSearch`、`apply_patch`、agent 工具、planning 工具等也能进入同一条 timeline；没有文件资源的工具会使用 `tool:<name>` 资源键。
+
+AID 则借鉴 AIDS/selftools 的 ToolEnvelope 思路，把每次 hook 事件包装成可迁移的工具信封，方便后续接 JSONL timeline、rating、MCP 或其他 runtime。
+
 ---
 
 *Built with [Claude Code](https://claude.ai/code) via [Aha](https://aha.engineering)*

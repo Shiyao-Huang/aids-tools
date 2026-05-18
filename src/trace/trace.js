@@ -17,7 +17,31 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
-const TRACE_OPERATIONS = new Set(['Write', 'Read', 'Edit', 'Bash']);
+const TRACE_OPERATIONS = new Set([
+  'Write',
+  'Read',
+  'Edit',
+  'MultiEdit',
+  'NotebookEdit',
+  'apply_patch',
+  'ApplyPatch',
+  'Bash',
+  'Shell',
+  'exec_command',
+  'WebFetch',
+  'WebSearch',
+  'Grep',
+  'Glob',
+  'LS',
+  'TodoWrite',
+  'update_plan',
+  'Task',
+  'spawn_agent',
+  'send_input',
+  'wait_agent',
+  'mcp',
+]);
+const WRITE_OPERATIONS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'apply_patch', 'ApplyPatch']);
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 2500;
 
@@ -260,7 +284,7 @@ function updateIndex(record) {
     index.lastRuntime = record.runtime;
     index.lastActorType = record.actor_type;
     index.lastTouchedAt = record.timestamp;
-    if (record.operation === 'Write' || record.operation === 'Edit') {
+    if (WRITE_OPERATIONS.has(record.operation)) {
       index.lastWriter = record.sessionId;
       index.lastWriterName = record.agentName;
       index.lastWriteIntent = record.purpose;

@@ -76,6 +76,87 @@ test('trace CLI emits JSON for recent traces', () => {
   assert.equal(parsed.traces[0].traceId, appended.traceId);
 });
 
+test('non-file tools can leave traces through the shared timeline', () => {
+  const home = tmpHome('tool-trace');
+  const { trace } = loadModules(home);
+  const appended = trace.appendTrace({
+    sessionId: 'tool-s',
+    operation: 'WebFetch',
+    filePath: 'tool:WebFetch',
+    purpose: 'fetch external context',
+    runtime: 'codex',
+  });
+
+  assert.equal(appended.operation, 'WebFetch');
+  assert.equal(trace.getRecentTraces('tool:WebFetch', 1)[0].traceId, appended.traceId);
+});
+
+test('post hook records non-file tool activity with synthetic tool resource', () => {
+  const home = tmpHome('post-hook-tool');
+  const result = spawnSync(process.execPath, ['hooks/post_tool_use.js'], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      AIDS_HOME: home,
+      AIDS_SESSION_ID: 'web-session',
+      AIDS_ROLE: 'researcher',
+      AIDS_RUNTIME: 'codex',
+      AIDS_INTENT: 'collect current docs',
+    },
+    input: JSON.stringify({
+      tool_name: 'WebFetch',
+      tool_input: { url: 'https://example.com' },
+      tool_response: { status: 200 },
+    }),
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const { trace } = loadModules(home);
+  const traces = trace.getRecentTraces('tool:WebFetch', 1);
+  assert.equal(traces[0].sessionId, 'web-session');
+  assert.equal(traces[0].operation, 'WebFetch');
+});
+
+test('pre hook keeps injected context inside line budget', () => {
+  const home = tmpHome('pre-hook-budget');
+  const { trace } = loadModules(home);
+  const file = path.join(home, 'shared.txt');
+  for (let i = 0; i < 4; i += 1) {
+    trace.appendTrace({
+      sessionId: `peer-${i}`,
+      role: 'agent',
+      operation: 'Write',
+      filePath: file,
+      purpose: `very long purpose ${i} that should be clipped to protect context budget`,
+      timestamp: `2026-05-18T00:00:0${i}.000Z`,
+    });
+  }
+
+  const result = spawnSync(process.execPath, ['hooks/pre_tool_use.js'], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      AIDS_HOME: home,
+      AIDS_SESSION_ID: 'current-agent',
+      AIDS_ROLE: 'implementer',
+      AIDS_RUNTIME: 'codex',
+      AIDS_AWARENESS_LINES: '5',
+      AIDS_AWARENESS_CHARS: '48',
+    },
+    input: JSON.stringify({
+      tool_name: 'Write',
+      tool_input: { file_path: file },
+    }),
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const lines = result.stderr.trim().split(/\r?\n/);
+  assert.ok(lines.length <= 5, result.stderr);
+  assert.match(result.stderr, /context lines clipped/);
+});
+
 test('ratings connect verdicts to trace summary and reputation', () => {
   const home = tmpHome('ratings');
   const { trace, ratings } = loadModules(home);

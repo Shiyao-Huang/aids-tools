@@ -107,7 +107,7 @@ function extractResourceKeys(toolName, toolInput) {
     return extractBashResources(toolInput.command || '');
   }
   const fp = toolInput.file_path || toolInput.path || '';
-  return fp ? [fp] : [];
+  return fp ? [fp] : [`tool:${toolName || 'unknown'}`];
 }
 
 /**
