@@ -150,6 +150,45 @@ class TestIndexKey(unittest.TestCase):
         self.assertLess(len(key), 80)
         self.assertTrue(key.startswith("sha256-"))
 
+    def test_bash_resource_stores_full_command(self):
+        """detect_resources() must preserve the full bash command in resource_path."""
+        long_cmd = "echo " + "x" * 500
+        resources = selftools.detect_resources("Bash", {"command": long_cmd}, "/tmp")
+        bash_res = [r for r in resources if r.startswith("bash:")]
+        self.assertEqual(len(bash_res), 1)
+        # Full command is preserved — not truncated
+        self.assertIn("x" * 500, bash_res[0])
+
+    def test_bash_redirect_creates_file_resource(self):
+        """Bash echo > file creates both bash: and file resources."""
+        resources = selftools.detect_resources(
+            "Bash", {"command": "echo hello > /tmp/out.txt"}, "/tmp"
+        )
+        self.assertTrue(any(r.startswith("bash:") for r in resources))
+        self.assertTrue(any("out.txt" in r for r in resources))
+
+    def test_bash_tee_creates_file_resource(self):
+        resources = selftools.detect_resources(
+            "Bash", {"command": "echo data | tee /tmp/log.txt"}, "/tmp"
+        )
+        self.assertTrue(any("log.txt" in r for r in resources))
+
+
+class TestDisplayResource(unittest.TestCase):
+    def test_short_bash_truncated(self):
+        long_res = "bash:" + "echo " * 200
+        displayed = selftools._display_resource(long_res)
+        self.assertLess(len(displayed), 130)
+        self.assertIn("bash:", displayed)
+
+    def test_file_path_untouched(self):
+        fp = "/some/path/to/file.py"
+        self.assertEqual(selftools._display_resource(fp), fp)
+
+    def test_short_bash_untouched(self):
+        short_bash = "bash:ls -la"
+        self.assertEqual(selftools._display_resource(short_bash), short_bash)
+
 
 class TestHumanAgo(unittest.TestCase):
     def test_seconds(self):
@@ -850,6 +889,103 @@ class TestBuildParser(unittest.TestCase):
         self.assertEqual(args.format, "csv")
         self.assertEqual(args.type, "timeline")
         self.assertEqual(args.days, 3)
+
+
+class TestDetectResources(unittest.TestCase):
+    def test_bash_command_not_truncated(self):
+        """Long bash commands must NOT be truncated in resource_path."""
+        long_cmd = "echo " + "x " * 300
+        resources = selftools.detect_resources("Bash", {"command": long_cmd}, "/tmp")
+        bash_res = [r for r in resources if r.startswith("bash:")]
+        self.assertEqual(len(bash_res), 1)
+        self.assertEqual(bash_res[0], f"bash:{long_cmd}")
+
+    def test_bash_redirect_target_extracted(self):
+        resources = selftools.detect_resources(
+            "Bash", {"command": 'echo "hello" > /tmp/out.txt'}, "/tmp"
+        )
+        paths = [r for r in resources if not r.startswith("bash:")]
+        self.assertTrue(any("out.txt" in p for p in paths))
+
+    def test_bash_tee_target_extracted(self):
+        resources = selftools.detect_resources(
+            "Bash", {"command": "cat /tmp/in.txt | tee /tmp/out.txt"}, "/tmp"
+        )
+        paths = [r for r in resources if not r.startswith("bash:")]
+        self.assertTrue(any("out.txt" in p for p in paths))
+
+    def test_bash_append_target_extracted(self):
+        resources = selftools.detect_resources(
+            "Bash", {"command": "echo line >> /tmp/log.txt"}, "/tmp"
+        )
+        paths = [r for r in resources if not r.startswith("bash:")]
+        self.assertTrue(any("log.txt" in p for p in paths))
+
+    def test_bash_cp_target_extracted(self):
+        resources = selftools.detect_resources(
+            "Bash", {"command": "cp /tmp/a.txt /tmp/b.txt"}, "/tmp"
+        )
+        paths = [r for r in resources if not r.startswith("bash:")]
+        self.assertTrue(any("b.txt" in p for p in paths))
+
+    def test_write_tool_extracts_file_path(self):
+        resources = selftools.detect_resources(
+            "Write", {"file_path": "/tmp/test.py", "content": "pass"}, "/tmp"
+        )
+        self.assertEqual(len(resources), 1)
+        self.assertIn("test.py", resources[0])
+
+    def test_read_tool_extracts_file_path(self):
+        resources = selftools.detect_resources(
+            "Read", {"file_path": "/tmp/test.py"}, "/tmp"
+        )
+        self.assertEqual(len(resources), 1)
+        self.assertIn("test.py", resources[0])
+
+    def test_mcp_tool_creates_mcp_resource(self):
+        resources = selftools.detect_resources(
+            "mcp__aha__start_task", {"taskId": "abc"}, "/tmp"
+        )
+        self.assertEqual(len(resources), 1)
+        self.assertTrue(resources[0].startswith("mcp:"))
+
+    def test_empty_bash_command(self):
+        resources = selftools.detect_resources("Bash", {"command": ""}, "/tmp")
+        bash_res = [r for r in resources if r.startswith("bash:")]
+        self.assertEqual(len(bash_res), 1)
+        self.assertEqual(bash_res[0], "bash:")
+
+    def test_dedup_preserves_order(self):
+        resources = selftools.detect_resources(
+            "Bash", {"command": "cp /tmp/a.txt /tmp/a.txt"}, "/tmp"
+        )
+        paths = [r for r in resources if not r.startswith("bash:")]
+        self.assertEqual(len(paths), 1)
+
+
+class TestIndexKeyDualLayer(unittest.TestCase):
+    def test_short_resource_uses_base64(self):
+        key = selftools.index_key("/tmp/short.py")
+        self.assertFalse(key.startswith("sha256-"))
+
+    def test_long_resource_uses_hash(self):
+        key = selftools.index_key("bash:" + "x " * 300)
+        self.assertTrue(key.startswith("sha256-"))
+        self.assertLess(len(key), 80)
+
+    def test_hash_key_still_unique(self):
+        k1 = selftools.index_key("bash:" + "x " * 300)
+        k2 = selftools.index_key("bash:" + "y " * 300)
+        self.assertNotEqual(k1, k2)
+
+    def test_load_index_preserves_full_resource_path(self):
+        long_resource = "bash:" + "echo " * 200
+        idx = {"resource_path": long_resource, "trace_ids": [], "total_ops": 0}
+        path = selftools.index_path(long_resource)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        selftools.write_json_atomic(path, idx)
+        loaded = selftools.load_index(long_resource)
+        self.assertEqual(loaded.get("resource_path"), long_resource)
 
 
 if __name__ == "__main__":
