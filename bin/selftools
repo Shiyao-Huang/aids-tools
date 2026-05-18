@@ -1278,12 +1278,21 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
     else:
         resources = detect_resources(tool_name, event.get("tool_input"), cwd)
         pre_by_resource = {res: (None if res.startswith(("bash:", "mcp:")) else sha256_file(Path(res))) for res in resources}
+    # Identify Bash read-only resources to skip hash computation and classify as "read"
+    bash_read_res: set = set()
+    if tool_name == "Bash":
+        cmd = str((event.get("tool_input") or {}).get("command") or "")
+        bash_read_res = set(parse_bash_read_resources(cmd, cwd))
+        for rr in bash_read_res:
+            if rr in pre_by_resource:
+                pre_by_resource[rr] = None
     trace_ids: List[str] = []
     timeline_events: List[Dict[str, Any]] = []
     intent = env_first("AIDS_INTENT", "AID_INTENT", "INTENT", "SELFTOOLS_INTENT", "ZHUYI_INTENT") or session.get("goal") or tool_intent(event)
     for res in resources:
         pre_hash = pre_by_resource.get(res)
-        post_hash = None if res.startswith(("bash:", "mcp:")) else sha256_file(Path(res))
+        is_bash_read = res in bash_read_res
+        post_hash = None if (res.startswith(("bash:", "mcp:")) or is_bash_read) else sha256_file(Path(res))
         if tool_name == "Read":
             post_hash = None
         trace = {
@@ -1292,7 +1301,7 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
             "agent_id": session.get("agent_id"),
             "tool": tool_name or "unknown",
             "resource_path": res,
-            "operation": operation_for(tool_name, res, pre_hash, post_hash),
+            "operation": "read" if is_bash_read else operation_for(tool_name, res, pre_hash, post_hash),
             "intent": intent,
             "pre_hash": pre_hash,
             "post_hash": post_hash,
@@ -1306,6 +1315,8 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
             "display_name": session.get("display_name"),
             "cwd": cwd,
             "tool_use_id": event.get("tool_use_id"),
+            "result": short(event.get("tool_result") or event.get("tool_response"), 500),
+            "model": session.get("model"),
             "metadata": {
                 "runtime": session.get("runtime"),
                 "permission_mode": event.get("permission_mode"),
@@ -1927,6 +1938,7 @@ DEFAULT_QUERY_CONFIG: Dict[str, Any] = {
 PROTECTED_CONFIG_KEYS: Dict[str, Any] = {
     "signature.enabled": True,
     "signature.strategy": "hash_chain",
+    "impact.enabled": True,
 }
 QUERY_MODULE_ALIASES = {"file_chain": "history"}
 
@@ -3168,12 +3180,86 @@ def cmd_commit_stamp(_: argparse.Namespace) -> int:
     return 0
 
 
+def _verify_single_trace(target_trace_id: str, *, as_json: bool = False) -> int:
+    """Verify a specific trace by replaying the chain up to that trace."""
+    ensure_layout()
+    traces_dir = data_dir() / "traces"
+    if not traces_dir.exists():
+        print(f"Trace {target_trace_id}: no traces directory.")
+        return 1
+
+    jsonl_files = sorted(traces_dir.glob("*.jsonl")) + sorted(traces_dir.glob("*.ndjson"))
+    found: Optional[Dict[str, Any]] = None
+    resource_traces: List[Dict[str, Any]] = []
+    target_resource: Optional[str] = None
+
+    for jf in jsonl_files:
+        try:
+            raw_lines = jf.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for raw_line in raw_lines:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                trace = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            tid = trace.get("trace_id")
+            res = str(trace.get("resource_path") or "")
+            if tid == target_trace_id:
+                found = trace
+                target_resource = res
+            if target_resource and res == target_resource:
+                resource_traces.append(trace)
+            if found and tid == target_trace_id:
+                break
+        if found:
+            break
+
+    if not found:
+        if as_json:
+            print(json_dump({"trace_id": target_trace_id, "status": "not_found"}))
+        else:
+            print(f"\u274c {target_trace_id}: not found")
+        return 1
+
+    # Replay chain up to the target trace
+    chain_state: Optional[str] = None
+    for tr in resource_traces:
+        if tr.get("trace_id") == target_trace_id:
+            break
+        chain_state = tr.get("chain_hash") or None
+
+    stored_hash = found.get("chain_hash")
+    if not stored_hash:
+        result = {"trace_id": target_trace_id, "status": "legacy", "detail": "no chain_hash (legacy trace)"}
+    elif _signature_backend.verify(found, chain_state, stored_hash):
+        result = {"trace_id": target_trace_id, "status": "valid", "detail": "chain hash verified"}
+    else:
+        result = {"trace_id": target_trace_id, "status": "TAMPERED", "detail": "chain_hash mismatch: trace was tampered or chain broken"}
+
+    if as_json:
+        print(json_dump(result))
+    else:
+        mark = "\u2705" if result["status"] in ("valid", "legacy") else "\u274c"
+        print(f"{mark} {result['trace_id']}: {result['detail']}")
+    return 0 if result["status"] != "TAMPERED" else 1
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Verify trace integrity: chain hash linkage and file hash consistency.
 
-    Walks all trace JSONL files, recomputes chain hashes, and flags any
+    If args.trace_id is given, verify only that specific trace.
+    Otherwise, walk all trace JSONL files, recompute chain hashes, and flag any
+    tampering or corruption.
     tampering or corruption.
     """
+    target_trace_id = getattr(args, "trace_id", None)
+    if target_trace_id:
+        return _verify_single_trace(target_trace_id, as_json=getattr(args, "json", False))
+
     ensure_layout()
     traces_dir = data_dir() / "traces"
     if not traces_dir.exists():
@@ -3213,16 +3299,17 @@ def cmd_verify(args: argparse.Namespace) -> int:
             resource = str(trace.get("resource_path") or "")
             stored_chain_hash = trace.get("chain_hash")
 
-            # ── Check 1: chain hash linkage (via SignatureBackend) ──
+            # ── Check 1: chain hash linkage ──
             if stored_chain_hash:
                 prev = chain_state.get(resource)
-                if not _signature_backend.verify(trace, prev, stored_chain_hash):
+                expected_hash = _chain_hash_for_trace(trace, prev)
+                if expected_hash != stored_chain_hash:
                     errors.append({
                         "file": str(jf), "line": line_no,
                         "trace_id": trace.get("trace_id"),
                         "resource": resource,
                         "error": "chain_hash mismatch: trace was tampered or chain broken",
-                        "expected": expected,
+                        "expected": expected_hash,
                         "stored": stored_chain_hash,
                     })
                 else:

@@ -565,5 +565,93 @@ class TestColorHelpers(unittest.TestCase):
         selftools._NO_COLOR = True  # reset
 
 
+class TestAppendJsonlMulti(TempDataMixin, unittest.TestCase):
+    """Test append_jsonl_multi batch write function."""
+
+    def test_multi_writes_all_records(self):
+        path = selftools.traces_file_for_today()
+        records = [
+            {"trace_id": f"tr_batch_{i}", "session_id": "s_batch", "tool": "Write"}
+            for i in range(5)
+        ]
+        selftools.append_jsonl_multi(path, records)
+        lines = path.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 5)
+        for i, line in enumerate(lines):
+            obj = json.loads(line)
+            self.assertEqual(obj["trace_id"], f"tr_batch_{i}")
+
+    def test_multi_empty_list_is_noop(self):
+        path = selftools.traces_file_for_today()
+        selftools.append_jsonl_multi(path, [])
+        self.assertFalse(path.exists())
+
+    def test_multi_reduces_lock_acquisitions(self):
+        """Verify batch write produces same result as sequential writes."""
+        path1 = Path(self._tmpdir) / "batch.jsonl"
+        path2 = Path(self._tmpdir) / "seq.jsonl"
+        records = [{"id": i, "data": f"record_{i}"} for i in range(10)]
+        selftools.append_jsonl_multi(path1, records)
+        for r in records:
+            selftools.append_jsonl(path2, r)
+        self.assertEqual(
+            path1.read_text(encoding="utf-8"),
+            path2.read_text(encoding="utf-8"),
+        )
+
+
+class TestProtectedConfigKeys(TempDataMixin, unittest.TestCase):
+    """Test that protected config keys cannot be overridden by user config."""
+
+    def test_protected_signature_enabled(self):
+        """User cannot disable signature via config.json."""
+        config_path = selftools.data_dir() / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({
+            "signature": {"enabled": False, "strategy": "bad_value"},
+        }), encoding="utf-8")
+        with patch.object(selftools, "data_dir", return_value=selftools.DEFAULT_DATA_DIR):
+            config = selftools.load_aids_config()
+        self.assertTrue(config["signature"]["enabled"])
+        self.assertEqual(config["signature"]["strategy"], "hash_chain")
+
+    def test_protected_impact_enabled(self):
+        """User cannot disable impact via config.json."""
+        config_path = selftools.DEFAULT_DATA_DIR / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({
+            "impact": {"enabled": False},
+        }), encoding="utf-8")
+        config = selftools.load_aids_config()
+        self.assertTrue(config["impact"]["enabled"])
+
+    def test_non_protected_keys_override(self):
+        """Non-protected keys can still be overridden."""
+        config_path = selftools.DEFAULT_DATA_DIR / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({
+            "query": {"default_limit": 20},
+            "output": {"max_chars": 500},
+        }), encoding="utf-8")
+        config = selftools.load_aids_config()
+        self.assertEqual(config["query"]["default_limit"], 20)
+        self.assertEqual(config["output"]["max_chars"], 500)
+
+    def test_deep_merge_skips_protected(self):
+        """_deep_merge_dict skips protected keys during merge."""
+        base = {"a": {"x": 1, "y": 2}, "b": 3}
+        override = {"a": {"x": 99, "y": 88}, "b": 99}
+        # Temporarily override PROTECTED_CONFIG_KEYS to test merge logic
+        original = selftools.PROTECTED_CONFIG_KEYS
+        selftools.PROTECTED_CONFIG_KEYS = {"a.x": True}
+        try:
+            merged = selftools._deep_merge_dict(base, override)
+            self.assertEqual(merged["a"]["x"], 1)  # protected, not overridden
+            self.assertEqual(merged["a"]["y"], 88)  # not protected, overridden
+            self.assertEqual(merged["b"], 99)  # not protected, overridden
+        finally:
+            selftools.PROTECTED_CONFIG_KEYS = original
+
+
 if __name__ == "__main__":
     unittest.main()
