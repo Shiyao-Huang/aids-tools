@@ -63,6 +63,11 @@ TOOLS: List[Dict[str, Any]] = [
         "description": "Check local AIDS installation health.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "aids_verify",
+        "description": "Verify trace integrity: chain hash linkage and config protection.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -106,6 +111,8 @@ def handle_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         return text_result(run_selftools(cmd))
     if name == "aids_doctor":
         return text_result(run_selftools(["doctor"]))
+    if name == "aids_verify":
+        return text_result(run_selftools(["verify"]))
     raise ValueError(f"Unknown tool: {name}")
 
 

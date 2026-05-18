@@ -4,6 +4,38 @@
 
 ---
 
+## Quick Install
+
+```bash
+curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
+```
+
+One line. Claude Code + Codex + Bash coverage, all automatic. Verify: `aids doctor`
+
+<details>
+<summary>More install options</summary>
+
+**From source:**
+```bash
+git clone https://github.com/Shiyao-Huang/aids-tools.git
+cd aids-tools && ./install.sh --source .
+```
+
+**Custom path:**
+```bash
+AIDS_HOME=~/.my-aids curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
+```
+
+**Uninstall:**
+```bash
+~/.aids/selftools/install.sh --uninstall        # keep data
+~/.aids/selftools/install.sh --uninstall --purge-data  # remove everything
+```
+
+</details>
+
+---
+
 ## Imagine a Shared Toy Box
 
 There's a big toy box in kindergarten. All the kids put things inside.
@@ -79,23 +111,9 @@ The next person who opens this file can see if any previous operations have bad-
 
 ---
 
-## Installation
+## Installation Details
 
-### One-Line Install
-
-```bash
-curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
-```
-
-After installation, all three layers are covered: Claude Code, Codex, and Bash. All operations automatically go into the same timeline.
-
-### Install from Source
-
-```bash
-git clone https://github.com/Shiyao-Huang/aids-tools.git
-cd aids-tools
-./install.sh --source .
-```
+> For the quick one-liner, see [Quick Install](#quick-install) at the top. Below are full options.
 
 ### Verify Installation
 
@@ -131,16 +149,6 @@ All green means you're good:
 
 ### Environment Variables
 
-All install paths support environment variable overrides:
-
-```bash
-# Custom data directory
-AIDS_HOME=~/.my-aids curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
-
-# Install from a fork
-AIDS_REPO=https://github.com/you/aids-tools.git curl -sfL ... | bash
-```
-
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AIDS_HOME` | `~/.aids` | Data root directory |
@@ -150,37 +158,13 @@ AIDS_REPO=https://github.com/you/aids-tools.git curl -sfL ... | bash
 | `CLAUDE_HOME` | `~/.claude` | Claude Code config directory |
 | `CODEX_HOME` | `~/.codex` | Codex config directory |
 
-### Uninstall
-
-```bash
-# Keep data (default)
-./install.sh --uninstall
-
-# Full purge (including traces, sessions, ratings)
-./install.sh --uninstall --purge-data
-
-# Preview uninstall actions
-./install.sh --uninstall --dry-run
-```
-
-Uninstall removes `~/.local/bin/aids*` symlinks, Claude/Codex hooks, and MCP config. `--purge-data` also deletes `~/.aids/` data.
-
 ### Post-Install Checklist
 
 ```bash
-# 1. Check command is available
 which aids          # → ~/.local/bin/aids
-
-# 2. Run diagnostics
 aids doctor         # → all green
-
-# 3. Register current session
 aids register-session
-
-# 4. List all sessions
 aids list-sessions
-
-# 5. Try a query
 aids q README.md
 ```
 

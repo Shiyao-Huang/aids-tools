@@ -4,6 +4,38 @@
 
 ---
 
+## 快速安装
+
+```bash
+curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
+```
+
+一行搞定。装完 Claude Code + Codex + Bash 三层自动覆盖。验证：`aids doctor`
+
+<details>
+<summary>其他安装方式</summary>
+
+**从源码安装：**
+```bash
+git clone https://github.com/Shiyao-Huang/aids-tools.git
+cd aids-tools && ./install.sh --source .
+```
+
+**自定义路径：**
+```bash
+AIDS_HOME=~/.my-aids curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
+```
+
+**卸载：**
+```bash
+~/.aids/selftools/install.sh --uninstall        # 保留数据
+~/.aids/selftools/install.sh --uninstall --purge-data  # 全部清除
+```
+
+</details>
+
+---
+
 ## 想象一个公共玩具箱
 
 幼儿园里有一个大玩具箱，所有小朋友都往里放东西。
@@ -79,23 +111,9 @@ Error: already rated by this session (INV-7 duplicate rejection)
 
 ---
 
-## 安装
+## 安装详细说明
 
-### 一键安装
-
-```bash
-curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
-```
-
-装完之后，Claude Code、Codex、Bash 三层全覆盖。所有操作自动进同一条 timeline。
-
-### 从源码安装
-
-```bash
-git clone https://github.com/Shiyao-Huang/aids-tools.git
-cd aids-tools
-./install.sh --source .
-```
+> 快速安装见顶部 [Quick Install](#快速安装)。以下是完整选项。
 
 ### 验证安装
 
@@ -131,16 +149,6 @@ aids doctor
 
 ### 环境变量
 
-所有安装路径都支持环境变量覆盖：
-
-```bash
-# 自定义数据目录
-AIDS_HOME=~/.my-aids curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
-
-# 从 fork 安装
-AIDS_REPO=https://github.com/you/aids-tools.git curl -sfL ... | bash
-```
-
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `AIDS_HOME` | `~/.aids` | 数据根目录 |
@@ -150,37 +158,13 @@ AIDS_REPO=https://github.com/you/aids-tools.git curl -sfL ... | bash
 | `CLAUDE_HOME` | `~/.claude` | Claude Code 配置目录 |
 | `CODEX_HOME` | `~/.codex` | Codex 配置目录 |
 
-### 卸载
-
-```bash
-# 保留数据（默认）
-./install.sh --uninstall
-
-# 完全清除（包括 traces、sessions、ratings）
-./install.sh --uninstall --purge-data
-
-# 预览卸载操作
-./install.sh --uninstall --dry-run
-```
-
-卸载内容：删除 `~/.local/bin/aids*` 符号链接、Claude/Codex hooks、MCP 配置。`--purge-data` 额外删除 `~/.aids/` 数据。
-
 ### 安装后检查清单
 
 ```bash
-# 1. 检查命令可用
 which aids          # → ~/.local/bin/aids
-
-# 2. 运行诊断
 aids doctor         # → 全绿
-
-# 3. 注册当前 session
 aids register-session
-
-# 4. 查看所有 session
 aids list-sessions
-
-# 5. 试一下查询
 aids q README.md
 ```
 
