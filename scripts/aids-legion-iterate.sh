@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# Disabled duplicate cron execution by Builder-2 launchd migration (2026-05-19).
+PARENT_COMM=$(ps -o comm= -p "${PPID:-0}" 2>/dev/null | tr -d ' ')
+if [ "$PARENT_COMM" = "cron" ] && [ -f "$HOME/Library/LaunchAgents/com.copizzah.aids-legion-iterate.plist" ]; then
+    echo "aids-legion cron wrapper disabled; launchd job is authoritative."
+    exit 0
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AIDS Legion Self-Iteration — 2h 定时 5 Claude + 5 Codex
 #

@@ -1638,7 +1638,70 @@ def cmd_who_touched(args: argparse.Namespace) -> int:
 
 
 def cmd_op_chain(args: argparse.Namespace) -> int:
-    return print_traces_for_resource(args.path, args.limit, as_json=args.json)
+    """Walk the parent_trace_id chain for a resource, showing the full lineage."""
+    ensure_layout()
+    res = normalize_resource(args.path)
+    limit = args.limit
+    idx = load_index(res)
+    if not idx:
+        disp = _display_resource(res)
+        print(f"No {ZH_NAME} traces for {disp}")
+        return 1
+    # Start from the last trace and walk backward via prev_trace_id
+    last_tid = idx.get("last_trace_id") or (idx.get("trace_ids") or [])[-1] if idx.get("trace_ids") else None
+    if not last_tid:
+        disp = _display_resource(res)
+        print(f"No {ZH_NAME} traces for {disp}")
+        return 1
+
+    chain: List[Dict[str, Any]] = []
+    seen: set = set()
+    current_tid = last_tid
+    while current_tid and current_tid not in seen and len(chain) < limit:
+        seen.add(current_tid)
+        trace = read_trace(current_tid)
+        if not trace:
+            break
+        sess = load_session(str(trace.get("session_id") or ""))
+        trace = dict(trace)
+        trace["session"] = sess
+        chain.append(trace)
+        current_tid = trace.get("prev_trace_id") or trace.get("parent_trace_id")
+
+    chain.reverse()
+    if args.json:
+        print(json_dump({"resource_path": res, "chain_length": len(chain), "chain": chain}))
+        return 0
+
+    # Display chain with lineage arrows
+    disp = _display_resource(res)
+    hdr = f" {ZH_NAME} op-chain: {disp} "
+    bar_w = max(len(hdr), 50)
+    bar = "\u2500" * bar_w
+    print(f"\n\u250c{bar}\u2510")
+    print(f"\u2502{_bold(hdr):<{bar_w}}\u2502")
+    print(f"\u251c{bar}\u2524")
+    for i, tr in enumerate(chain):
+        sess = tr.get("session") or {}
+        aid = tr.get("agent_id") or sess.get("agent_id") or ""
+        actor = sess.get("display_name") or tr.get("session_id") or "?"
+        aid_display = f" [{aid[:12]}...]" if aid else ""
+        op = tr.get("operation") or "touch"
+        sym = _OPERATION_SYMBOLS.get(op, " ")
+        op_colored = _OPERATION_COLORS.get(op, str)(f"{sym} {op}")
+        role_str = _role_color(sess.get("role") or "unknown")
+        ago = human_ago(int(tr.get("timestamp") or now_ms()))
+        intent_str = short(tr.get("intent") or "", 120)
+        tid_short = (tr.get("trace_id") or "")[:8]
+        prev_short = (tr.get("prev_trace_id") or "")[:8]
+        link = f"{_dim(prev_short)}→{_cyan(tid_short)}" if prev_short else _cyan(tid_short)
+        prefix = "  " if i == 0 else "  ↓ "
+        print(f"\u2502 {prefix}{link} {op_colored} by {_cyan(str(actor))}{aid_display} ({role_str}) {ago}")
+        if intent_str:
+            print(f"\u2502       intent: {intent_str}")
+    print(f"\u2514{bar}\u2518")
+    print(f" chain depth: {len(chain)}")
+    return 0
 
 
 def cmd_session_info(args: argparse.Namespace) -> int:
@@ -3279,6 +3342,97 @@ def _compute_importance(dependents: List[str], git_entries: List[Dict[str, Any]]
     return "low"
 
 
+def cmd_prune(args: argparse.Namespace) -> int:
+    """Remove stale data: retired sessions, old trace/rating/timeline files, stale locks."""
+    ensure_layout(skip_stale_clean=True)
+    dd = data_dir()
+    days = getattr(args, "days", 30) or 30
+    cutoff = _dt.datetime.now() - _dt.timedelta(days=days)
+    cutoff_ts = cutoff.timestamp()
+    dry_run = getattr(args, "dry_run", False)
+    json_out = getattr(args, "json", False)
+
+    removed: Dict[str, int] = {
+        "sessions": 0,
+        "traces": 0,
+        "ratings": 0,
+        "timeline": 0,
+        "locks": 0,
+        "bytes_freed": 0,
+    }
+
+    def _remove(f: Path, category: str) -> None:
+        try:
+            sz = f.stat().st_size
+            if not dry_run:
+                f.unlink(missing_ok=True)
+            removed[category] += 1
+            removed["bytes_freed"] += sz
+        except OSError:
+            pass
+
+    # 1. Prune retired sessions older than cutoff
+    sessions_dir = dd / "sessions"
+    if sessions_dir.exists():
+        for sf in sessions_dir.glob("*.json"):
+            try:
+                rec = read_json(sf, {})
+                if not rec:
+                    _remove(sf, "sessions")
+                    continue
+                status = rec.get("status", "")
+                if status != "retired":
+                    continue
+                # Check last_seen or started timestamp
+                ts = rec.get("last_seen_at") or rec.get("started_at") or 0
+                if isinstance(ts, (int, float)) and ts / 1000.0 < cutoff_ts:
+                    _remove(sf, "sessions")
+            except (OSError, ValueError):
+                pass
+
+    # 2. Prune old JSONL files in traces/, ratings/, timeline/
+    for category in ("traces", "ratings", "timeline"):
+        cat_dir = dd / category
+        if not cat_dir.exists():
+            continue
+        for jf in cat_dir.glob("*.jsonl"):
+            try:
+                if jf.stat().st_mtime < cutoff_ts:
+                    _remove(jf, category)
+            except OSError:
+                pass
+
+    # 3. Clean stale lock files
+    locks_dir = dd / "locks"
+    if locks_dir.exists():
+        now = time.time()
+        for lf in locks_dir.glob("*.lock"):
+            try:
+                if now - lf.stat().st_mtime > FileLock.STALE_SECONDS:
+                    _remove(lf, "locks")
+            except OSError:
+                pass
+
+    total = sum(v for k, v in removed.items() if k != "bytes_freed")
+    freed_mb = removed["bytes_freed"] / (1024 * 1024)
+
+    if json_out:
+        removed["dry_run"] = dry_run
+        removed["cutoff_days"] = days
+        print(json.dumps(removed, indent=2))
+    else:
+        prefix = "[DRY RUN] " if dry_run else ""
+        print(f"{prefix}Pruned data older than {days} days:")
+        print(f"  sessions: {removed['sessions']}")
+        print(f"  traces:   {removed['traces']}")
+        print(f"  ratings:  {removed['ratings']}")
+        print(f"  timeline: {removed['timeline']}")
+        print(f"  locks:    {removed['locks']}")
+        print(f"  total:    {total} files, {freed_mb:.1f} MB freed")
+
+    return 0
+
+
 def cmd_impact(args: argparse.Namespace) -> int:
     """Show file impact analysis: dependents, dependencies, importance, risk."""
     file_path = normalize_resource(args.path)
@@ -4009,6 +4163,12 @@ def build_parser() -> argparse.ArgumentParser:
     cs = sub.add_parser("commit-stamp", help="Output git commit trailer with session identity and AIDS trace summary")
     cs.add_argument("--json", action="store_true", help="JSON output")
     cs.set_defaults(func=cmd_commit_stamp)
+
+    prune = sub.add_parser("prune", help="Remove stale data: old sessions, traces, locks")
+    prune.add_argument("--days", type=int, default=30, help="Remove data older than N days (default: 30)")
+    prune.add_argument("--dry-run", action="store_true", dest="dry_run", help="Show what would be removed without deleting")
+    prune.add_argument("--json", action="store_true")
+    prune.set_defaults(func=cmd_prune)
 
     doctor = sub.add_parser("doctor", help="Verify installation")
     doctor.add_argument("--json", action="store_true")

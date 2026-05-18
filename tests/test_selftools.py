@@ -2645,5 +2645,106 @@ class TestListSessionsRuntimeInfer(TempDataMixin, unittest.TestCase):
         self.assertEqual(result["sessions"][0]["runtime"], "bash")
 
 
+class TestCmdPrune(TempDataMixin, unittest.TestCase):
+    def test_prune_dry_run_nothing(self):
+        """Dry run on empty data dir should report zero removals."""
+        args = selftools.build_parser().parse_args(["prune", "--dry-run", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_prune(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["dry_run"], True)
+        self.assertEqual(result["sessions"], 0)
+        self.assertEqual(result["traces"], 0)
+        self.assertEqual(result["ratings"], 0)
+        self.assertEqual(result["timeline"], 0)
+
+    def test_prune_removes_retired_sessions(self):
+        """Prune should remove retired sessions older than --days."""
+        dd = selftools.data_dir()
+        old_ts = _dt.datetime.now().timestamp() * 1000 - 40 * 86400000  # 40 days ago
+        record = {
+            "session_id": "prune-test-1",
+            "status": "retired",
+            "last_seen_at": old_ts,
+        }
+        selftools.write_json_atomic(dd / "sessions" / "prune-test-1.json", record)
+        args = selftools.build_parser().parse_args(["prune", "--days", "30", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_prune(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertGreaterEqual(result["sessions"], 1)
+        self.assertFalse((dd / "sessions" / "prune-test-1.json").exists())
+
+    def test_prune_keeps_active_sessions(self):
+        """Prune should NOT remove active sessions even if old."""
+        dd = selftools.data_dir()
+        old_ts = _dt.datetime.now().timestamp() * 1000 - 40 * 86400000
+        record = {
+            "session_id": "prune-active-1",
+            "status": "active",
+            "last_seen_at": old_ts,
+        }
+        selftools.write_json_atomic(dd / "sessions" / "prune-active-1.json", record)
+        args = selftools.build_parser().parse_args(["prune", "--days", "30", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_prune(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["sessions"], 0)
+        self.assertTrue((dd / "sessions" / "prune-active-1.json").exists())
+
+
+class TestOpChainLineage(TempDataMixin, unittest.TestCase):
+    def test_op_chain_walks_prev_trace_id(self):
+        """op-chain should follow prev_trace_id links backward."""
+        dd = selftools.data_dir()
+        res = str(dd / "test-lineage-file.py")
+        norm_res = selftools.normalize_resource(res)
+        # Build a chain of 3 traces
+        t1_ts = _dt.datetime.now().timestamp() * 1000 - 3000
+        t2_ts = t1_ts + 1000
+        t3_ts = t2_ts + 1000
+        traces = [
+            {"trace_id": "tid_aaa1", "session_id": "s1", "operation": "Read", "resource_path": norm_res,
+             "timestamp": t1_ts, "prev_trace_id": None},
+            {"trace_id": "tid_aaa2", "session_id": "s1", "operation": "Edit", "resource_path": norm_res,
+             "timestamp": t2_ts, "prev_trace_id": "tid_aaa1"},
+            {"trace_id": "tid_aaa3", "session_id": "s2", "operation": "Write", "resource_path": norm_res,
+             "timestamp": t3_ts, "prev_trace_id": "tid_aaa2"},
+        ]
+        # Write traces to today's file
+        today = _dt.datetime.now().strftime("%Y-%m-%d")
+        (dd / "traces").mkdir(parents=True, exist_ok=True)
+        trace_file = dd / "traces" / f"{today}.jsonl"
+        with open(trace_file, "a") as f:
+            for t in traces:
+                f.write(json.dumps(t) + "\n")
+        # Write index with last_trace_id pointing to the last trace
+        idx_data = {"resource_path": norm_res, "trace_ids": ["tid_aaa1", "tid_aaa2", "tid_aaa3"],
+                    "last_trace_id": "tid_aaa3", "count": 3}
+        selftools.write_json_atomic(
+            dd / "index" / f"{selftools.index_key(norm_res)}.json", idx_data)
+        args = selftools.build_parser().parse_args(["op-chain", "--json", res])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_op_chain(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["chain_length"], 3)
+        # Verify order: oldest first
+        self.assertEqual(result["chain"][0]["trace_id"], "tid_aaa1")
+        self.assertEqual(result["chain"][1]["trace_id"], "tid_aaa2")
+        self.assertEqual(result["chain"][2]["trace_id"], "tid_aaa3")
+
+
 if __name__ == "__main__":
     unittest.main()
