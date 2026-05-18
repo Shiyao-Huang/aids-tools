@@ -1445,7 +1445,7 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
             "display_name": session.get("display_name"),
             "cwd": cwd,
             "tool_use_id": event.get("tool_use_id"),
-            "result": short(event.get("tool_result") or event.get("tool_response"), 500),
+            "result": _extract_result(event),
             "model": session.get("model"),
             "metadata": {
                 "runtime": session.get("runtime"),
@@ -1468,6 +1468,39 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
         )
         hook_output("PostToolUse", message, post=True)
     return 0
+
+
+def _extract_result(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract structured result info from a PostToolUse event.
+
+    Always returns a dict with at least ``status`` so the field is never empty.
+    """
+    raw = event.get("tool_result") or event.get("tool_response") or ""
+    is_error = event.get("is_error") is True or event.get("isError") is True
+
+    # Detect error status from response content
+    if not is_error and isinstance(raw, str):
+        lower = raw.lower()
+        if lower.startswith("error:") or "permission denied" in lower:
+            is_error = True
+
+    # Parse exit_code from Bash output patterns
+    exit_code: Optional[int] = None
+    raw_str = str(raw) if raw else ""
+    m = re.search(r"[Ee]xit\s+code:\s*(\d+)", raw_str)
+    if m:
+        exit_code = int(m.group(1))
+    elif is_error:
+        exit_code = 1
+
+    result: Dict[str, Any] = {
+        "status": "error" if is_error else "success",
+    }
+    if exit_code is not None:
+        result["exit_code"] = exit_code
+    if raw_str:
+        result["preview"] = short(raw_str, 300)
+    return result
 
 
 def tool_intent(event: Dict[str, Any]) -> str:

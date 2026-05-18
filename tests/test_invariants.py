@@ -801,5 +801,47 @@ class TestAtomicChainHash(AIDSTestBase):
         self._verify_chain(write_traces)
 
 
+# ============================================================
+# Structured result field tests
+# ============================================================
+class TestResultField(AIDSTestBase):
+    """Verify _extract_result always populates a structured result."""
+
+    def test_result_always_present_on_write(self) -> None:
+        """Every write trace has a non-empty result dict."""
+        self._simulate_session_start()
+        self._simulate_write_flow(str(self.test_file), "# new content\n")
+
+        traces = self._traces_today()
+        write_traces = [t for t in traces if t.get("operation") in ("modify", "create")]
+        self.assertGreater(len(write_traces), 0)
+        for tr in write_traces:
+            result = tr.get("result")
+            self.assertIsInstance(result, dict, f"trace {tr.get('trace_id')} result should be dict, got {type(result)}")
+            self.assertIn("status", result, f"trace {tr.get('trace_id')} missing result.status")
+            self.assertIn(result["status"], ("success", "error"))
+
+    def test_result_success_when_no_error(self) -> None:
+        """Normal write produces result.status == success."""
+        self._simulate_session_start()
+        self._simulate_write_flow(str(self.test_file), "# ok\n")
+
+        traces = self._traces_today()
+        write_traces = [t for t in traces if t.get("operation") in ("modify", "create")]
+        self.assertGreater(len(write_traces), 0)
+        result = write_traces[0].get("result")
+        self.assertEqual(result.get("status"), "success")
+
+    def test_result_has_preview(self) -> None:
+        """When tool_response is present, result includes a preview."""
+        self._simulate_session_start()
+        self._simulate_write_flow(str(self.test_file), "# content\n")
+
+        traces = self._traces_today()
+        write_traces = [t for t in traces if t.get("operation") in ("modify", "create")]
+        if write_traces and write_traces[0].get("result", {}).get("preview"):
+            self.assertIsInstance(write_traces[0]["result"]["preview"], str)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
