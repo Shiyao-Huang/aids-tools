@@ -436,12 +436,19 @@ class FileLock:
         deadline = time.monotonic() + timeout
 
         while True:
-            self._break_stale_lock(check_ttl=False)
+            # On Unix, fcntl locks are tied to the inode opened by each
+            # process.  Unlinking a lock file during normal acquisition can
+            # create a second inode at the same path, allowing two contenders
+            # to hold "the same" lock at once.  Let fcntl handle dead holders
+            # automatically; only the non-fcntl fallback needs stale-file
+            # cleanup in the acquire path.
+            if fcntl is None:
+                self._break_stale_lock(check_ttl=False)
             if self._try_acquire_nb():
                 return self
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                if self._break_stale_lock(check_ttl=False) and self._try_acquire_nb():
+                if fcntl is None and self._break_stale_lock(check_ttl=False) and self._try_acquire_nb():
                     return self
                 raise TimeoutError(
                     f"Lock {self.path} not acquired within {timeout}s"
@@ -456,14 +463,15 @@ class FileLock:
 
         deadline = time.monotonic() + self.timeout
         while True:
-            self._break_stale_lock(check_ttl=False)
-            self._clean_stale_mtime()
+            if fcntl is None:
+                self._break_stale_lock(check_ttl=False)
+                self._clean_stale_mtime()
             if self._try_acquire_nb():
                 return self
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 # One last attempt after stale-break
-                if self._break_stale_lock(check_ttl=False) and self._try_acquire_nb():
+                if fcntl is None and self._break_stale_lock(check_ttl=False) and self._try_acquire_nb():
                     return self
                 raise TimeoutError(
                     f"Lock {self.path} not acquired within {self.timeout}s"

@@ -16,6 +16,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { spawnSync } = require('child_process');
 
 const TRACE_OPERATIONS = new Set([
   'Write',
@@ -134,7 +135,23 @@ function newUuid() {
 }
 
 function sleep(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const delay = Math.max(0, Number(ms) || 0);
+  if (!delay) return;
+
+  // Keep the lock API synchronous without relying on Atomics.wait /
+  // SharedArrayBuffer support in worker-like runtimes.
+  const result = spawnSync(
+    process.execPath,
+    ['-e', 'setTimeout(() => {}, Number(process.argv[1]) || 0);', String(delay)],
+    { stdio: 'ignore' },
+  );
+
+  if (result.error) {
+    const deadline = Date.now() + delay;
+    while (Date.now() < deadline) {
+      // Fallback for environments where spawning node is unavailable.
+    }
+  }
 }
 
 function withLock(name, fn) {
