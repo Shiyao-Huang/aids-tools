@@ -782,10 +782,8 @@ def parse_bash_write_resources(command: str, cwd: str) -> List[str]:
 
         if target and not target.startswith(("-", "&")):
             # Skip special device paths that produce meaningless traces
-            if target in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
-                target = None
-                continue
-            resources.append(normalize_resource(target, cwd))
+            if target not in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
+                resources.append(normalize_resource(target, cwd))
         index += 1
 
     seen = set()
