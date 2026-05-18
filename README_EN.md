@@ -81,10 +81,17 @@ Every time someone modifies a file, AIDS automatically records:
 
 ```bash
 $ aids who-touched config.json
-AIDS (Agent-ID System) traces for config.json:
-- tr_9c60b2582ac1 read Read by Claude Implementer (implementer) 2min ago; intent: Fix login bug
-- tr_ff77921e50b3 modify Modify by Codex Architect (architect) 15min ago; intent: Adjust database config
-- tr_10037a3d9745 modify Modify by bash-human-001 (developer) 1h ago; intent: Manually changed port number
+┌──────────────────────────────────────────────────────────────┐
+│ AIDS (Agent-ID System) who-touched: config.json              │
+├──────────────────────────────────────────────────────────────┤
+│ tr_9c60b258 > read Read by Claude Impl (implementer) 2m ago
+│ │ intent: Fix login bug
+│ tr_ff77921 ~ modify Edit by Codex Architect (architect) 15m ago
+│ │ intent: Adjust database config
+│ tr_10037a3 ~ modify Edit by bash-human (developer) 1h ago
+│ │ intent: Manually changed port number
+└──────────────────────────────────────────────────────────────┘
+  >read:1  ~modify:2  |  3 distinct agents
 ```
 
 Before writing, AIDS **gives you a heads-up** if someone recently touched the file (read-before-write guard):
@@ -399,10 +406,12 @@ Previously only write operations were tracked. Now 20+ read commands like `cat`,
 ```bash
 # Agent ran: cat config.json | grep database
 $ aids who-touched config.json
-AIDS (Agent-ID System) who-touched: config.json
-───────────────────────────────────────────
-│ tr_a1b2c3 read cat by Claude Impl #1 (implementer) 2min ago
-│ tr_d4e5f6 modify Edit by Codex Architect (architect) 15min ago
+┌──────────────────────────────────────────────────────────────┐
+│ AIDS (Agent-ID System) who-touched: config.json              │
+├──────────────────────────────────────────────────────────────┤
+│ tr_a1b2c3 > read cat by Claude Impl #1 (implementer) 2m ago
+│ tr_d4e5f6 ~ modify Edit by Codex Architect (architect) 15m ago
+└──────────────────────────────────────────────────────────────┘
 ```
 
 **Not just "who changed it" — now even "who read it" is tracked.**
@@ -412,14 +421,14 @@ AIDS (Agent-ID System) who-touched: config.json
 Terminal `who-touched` now uses color — different roles get different colors, operation types have symbol indicators:
 
 ```
-╭──────────────────────────────────────╮
-│ AIDS who-touched: config.json        │
-├──────────────────────────────────────┤
-│ tr_a1b2 ✎ Write by Claude Impl (implementer) 2min ago
-│ tr_d4e5 ✎ Edit by Codex Architect (architect) 15min ago
-│ tr_7a8b 👁 Read by bash-human (developer) 1h ago
-╰──────────────────────────────────────╯
-  3 traces  |  3 distinct agents
+┌──────────────────────────────────────────────────────────────┐
+│ AIDS (Agent-ID System) who-touched: config.json              │
+├──────────────────────────────────────────────────────────────┤
+│ tr_a1b2 ~ modify Write by Claude Impl (implementer) 2m ago
+│ tr_d4e5 ~ modify Edit by Codex Architect (architect) 15m ago
+│ tr_7a8b > read Read by bash-human (developer) 1h ago
+└──────────────────────────────────────────────────────────────┘
+  >read:1  ~modify:2  |  3 distinct agents
 ```
 
 Supports `--sort time|role|op` ordering. Respects `NO_COLOR` environment variable.
@@ -430,6 +439,13 @@ Don't memorize commands — just ask:
 
 ```bash
 $ aids q README.md              # Full story of a file
+🧭 AIDS query: README.md (file)
+👤 identity: current: Claude Impl #2 (implementer/claude)
+📜 history: 5 recent trace(s).
+✍️ signature: hash_chain: recent traces found.
+💥 impact: grep fallback found 5 reference(s).
+⭐ ratings: No ratings found.
+
 $ aids q tr_abc123              # Look up a specific trace
 $ aids q agent-7f3a9c2e1d       # Query by agent_id
 ```
