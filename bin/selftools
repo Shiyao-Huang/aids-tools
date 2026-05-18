@@ -507,8 +507,8 @@ def load_index(resource: str) -> Dict[str, Any]:
 
 def update_index(resource: str, trace: Dict[str, Any], session: Dict[str, Any]) -> None:
     path = index_path(resource)
-    lock_path = data_dir() / "locks" / f"index-{index_key(resource)}.lock"
-    with FileLock(lock_path):  # index locks already unique via base64 key
+    lock_path = lock_path_for(path)
+    with FileLock(lock_path):
         idx = read_json(path, {}) or {}
         trace_ids = list(idx.get("trace_ids") or [])
         trace_ids.append(trace["trace_id"])
