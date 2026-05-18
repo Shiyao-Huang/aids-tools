@@ -715,7 +715,7 @@ def detect_resources(tool_name: str, tool_input: Any, cwd: str) -> List[str]:
     if tool_name == "apply_patch" or ("*** Begin Patch" in str(tool_input.get("command") or "")):
         resources.extend(parse_apply_patch_resources(str(tool_input.get("command") or ""), cwd))
     if tool_name == "Bash":
-        cmd = short(tool_input.get("command") or "", 240)
+        cmd = str(tool_input.get("command") or "")
         resources.append(f"bash:{cmd}")
         resources.extend(parse_bash_write_resources(str(tool_input.get("command") or ""), cwd))
     if tool_name.startswith("mcp__"):
@@ -741,12 +741,19 @@ def parse_bash_write_resources(command: str, cwd: str) -> List[str]:
     while index < len(tokens):
         token = tokens[index]
         target: Optional[str] = None
-        if token in {">", ">>"} and index + 1 < len(tokens):
+        # Standalone redirect operators: target is next token.
+        _REDIRECT_OPS = {">", ">>", "2>", "2>>", "&>", "&>>"}
+        if token in _REDIRECT_OPS and index + 1 < len(tokens):
             target = tokens[index + 1]
             index += 1
-        elif token.startswith(">>") and len(token) > 2:
+        # Attached redirect prefixes: strip longest-matching prefix.
+        elif len(token) > 3 and token.startswith(("2>>", "&>>")):
+            target = token[3:]
+        elif len(token) > 2 and token.startswith(">>"):
             target = token[2:]
-        elif token.startswith(">") and len(token) > 1:
+        elif len(token) > 2 and token.startswith(("2>", "&>")):
+            target = token[2:]
+        elif len(token) > 1 and token.startswith(">"):
             target = token[1:]
         elif token == "tee":
             probe = index + 1
@@ -1120,7 +1127,7 @@ def cmd_op_chain(args: argparse.Namespace) -> int:
 def cmd_session_info(args: argparse.Namespace) -> int:
     record = load_session(args.session_id)
     if not record:
-        print(f"No session found for {args.session_id}", file=sys.stderr)
+        eprint_identity(f"No session found for {args.session_id}")
         return 1
     if args.json:
         print(json_dump(record))
@@ -1140,7 +1147,7 @@ def cmd_retire_session(args: argparse.Namespace) -> int:
     sid = args.session_id
     record = load_session(sid)
     if not record:
-        print(f"No session found for {sid}", file=sys.stderr)
+        eprint_identity(f"No session found for {sid}")
         return 1
     record["status"] = "retired"
     record["last_seen_at"] = now_ms()
@@ -1193,7 +1200,7 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
     sid = args.session_id
     record = load_session(sid)
     if not record:
-        print(f"No session found for {sid}", file=sys.stderr)
+        eprint_identity(f"No session found for {sid}")
         return 1
     record["last_seen_at"] = now_ms()
     record["last_seen_iso"] = iso_now()
@@ -1210,7 +1217,7 @@ def cmd_whois(args: argparse.Namespace) -> int:
     sid = args.session_id
     record = load_session(sid)
     if not record:
-        print(f"Unknown session: {sid}", file=sys.stderr)
+        eprint_identity(f"Unknown session: {sid}")
         return 1
     if args.json:
         print(json_dump(record))
@@ -1260,7 +1267,7 @@ def cmd_rate(args: argparse.Namespace) -> int:
     ensure_layout()
     trace = read_trace(args.trace_id)
     if trace is None:
-        print(f"Trace not found: {args.trace_id}", file=sys.stderr)
+        eprint_identity(f"Trace not found: {args.trace_id}")
         return 1
     rater = env_first("AIDS_SESSION_ID", "AID_SESSION_ID", "SESSION_ID", "SELFTOOLS_SESSION_ID", "ZHUYI_SESSION_ID") or "anonymous"
     rating = {
@@ -1284,7 +1291,7 @@ def cmd_timeline(args: argparse.Namespace) -> int:
     ensure_layout()
     tl_file = timeline_file_for_today()
     if not tl_file.exists():
-        print("No timeline events today.", file=sys.stderr)
+        eprint_identity("No timeline events today.")
         return 1
     events = [json.loads(l) for l in tl_file.read_text().strip().splitlines() if l.strip()]
     events = events[-args.limit:]
@@ -2163,12 +2170,12 @@ def cmd_export(args: argparse.Namespace) -> int:
         date_from, date_to = _export_date_range(args)
         type_names = _export_type_names(type_name)
     except ValueError as exc:
-        print(f"aids export: {exc}", file=sys.stderr)
+        eprint_identity(f"aids export: {exc}")
         return 2
 
     if fmt == "csv" and (len(type_names) != 1 or type_names[0] not in CSV_EXPORT_TYPES):
         allowed = ", ".join(sorted(CSV_EXPORT_TYPES))
-        print(f"aids export: CSV output is only supported for one flat type: {allowed}", file=sys.stderr)
+        eprint_identity(f"aids export: CSV output is only supported for one flat type: {allowed}")
         return 2
 
     data: Dict[str, List[Dict[str, Any]]] = {
@@ -2219,6 +2226,510 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+# ────────────────────────────────────────────────────────────────
+# CodeGraph — built-in code graph analysis (zero external deps)
+# Parses Python ast + JS import/export + generic text refs
+# Caches to ~/.aids/codegraph/{sha256(root)}.json
+# ────────────────────────────────────────────────────────────────
+
+CODEGRAPH_MAX_FILES = 5000
+CODEGRAPH_MAX_CACHE_MB = 50
+_GENERIC_SKIP_STEMS = frozenset({"index", "main", "app", "config", "utils", "helpers", "types", "constants"})
+
+
+def _codegraph_cache_path(project_root: str) -> Path:
+    h = hashlib.sha256(project_root.encode("utf-8")).hexdigest()[:16]
+    return data_dir() / "codegraph" / f"{h}.json"
+
+
+def _file_signature(path: Path) -> Optional[str]:
+    try:
+        st = path.stat()
+        return f"{int(st.st_mtime)}:{st.st_size}"
+    except OSError:
+        return None
+
+
+def _collect_source_files(root: Path) -> Dict[str, str]:
+    """Walk root and return {relative_path: mtime:size} for all source files."""
+    sigs: Dict[str, str] = {}
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox",
+                 "dist", "build", ".next", ".aids", ".gitnexus"}
+    src_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+        for fn in filenames:
+            if os.path.splitext(fn)[1].lower() not in src_exts:
+                continue
+            fp = Path(dirpath) / fn
+            try:
+                rel = str(fp.relative_to(root))
+            except ValueError:
+                continue
+            sig = _file_signature(fp)
+            if sig:
+                sigs[rel] = sig
+                count += 1
+                if count >= CODEGRAPH_MAX_FILES:
+                    return sigs
+    return sigs
+
+
+def _parse_py_imports(source: str) -> List[str]:
+    """Extract top-level module names from Python import statements via ast."""
+    modules: List[str] = []
+    try:
+        tree = _ast.parse(source)
+    except (SyntaxError, ValueError):
+        return modules
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                modules.append(alias.name.split(".")[0])
+        elif isinstance(node, _ast.ImportFrom):
+            if node.module:
+                modules.append(node.module.split(".")[0])
+    return list(dict.fromkeys(modules))
+
+
+def _parse_py_exports(source: str) -> List[str]:
+    """Extract top-level function and class names from Python source."""
+    names: List[str] = []
+    try:
+        tree = _ast.parse(source)
+    except (SyntaxError, ValueError):
+        return names
+    for node in _ast.iter_child_nodes(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            names.append(node.name)
+        elif isinstance(node, _ast.ClassDef):
+            names.append(node.name)
+    return names
+
+
+def _parse_js_imports(source: str) -> List[str]:
+    """Extract module specifiers from JS/TS import/require via re."""
+    modules: List[str] = []
+    for pat in [
+        r"""(?:import|export)\s+(?:.*?)\s+from\s+['"\`]([^'"\`]+)['"\`]""",
+        r"""import\s+['"\`]([^'"\`]+)['"\`]""",
+        r"""require\s*\(\s*['"\`]([^'"\`]+)['"\`]\s*\)""",
+    ]:
+        for m in re.finditer(pat, source):
+            mod = m.group(1)
+            modules.append(mod.split("/")[0] if not mod.startswith(".") else mod)
+    return list(dict.fromkeys(modules))
+
+
+def _parse_js_exports(source: str) -> List[str]:
+    """Extract exported names from JS/TS source via re."""
+    names: List[str] = []
+    for pat in [
+        r"""export\s+(?:default\s+)?(?:function|const|let|var|class)\s+(\w+)""",
+        r"""export\s+\{([^}]+)\}""",
+        r"""module\.exports\s*=\s*\{([^}]+)\}""",
+    ]:
+        for m in re.finditer(pat, source):
+            for name in re.findall(r"(\w+)", m.group(1)):
+                if name not in {"as", "from", "default", "const", "let", "var", "function", "class"}:
+                    names.append(name)
+    return list(dict.fromkeys(names))
+
+
+def _resolve_module(mod: str, from_file: str, root: Path) -> Optional[str]:
+    """Resolve a module name to a relative file path under root."""
+    if not mod.startswith("."):
+        candidates = [
+            mod.replace(".", "/") + ".py",
+            mod.replace(".", "/") + "/__init__.py",
+            mod + ".js", mod + ".ts",
+            mod + "/index.js", mod + "/index.ts",
+        ]
+    else:
+        base_dir = Path(from_file).parent
+        base = mod.replace(".", "/").rstrip("/") or "."
+        candidates = [str(c) for c in [
+            base_dir / (base + ".py"), base_dir / (base + "/__init__.py"),
+            base_dir / (base + ".js"), base_dir / (base + ".ts"),
+            base_dir / base / "index.js", base_dir / base / "index.ts",
+        ]]
+    for cand in candidates:
+        if (root / cand).exists():
+            return cand
+    return None
+
+
+def analyze_project(root: Path, *, force: bool = False) -> Dict[str, Any]:
+    """Analyze a project's code graph: imports, exports, dependencies.
+    Caches to ~/.aids/codegraph/ and auto-refreshes on file changes.
+    """
+    ensure_layout()
+    root_str = str(root.resolve())
+    cache_path = _codegraph_cache_path(root_str)
+
+    if not force and cache_path.exists():
+        cached = read_json(cache_path, {})
+        if cached and cached.get("root") == root_str:
+            if (cached.get("file_signatures") or {}) == _collect_source_files(root):
+                return cached
+
+    sigs = _collect_source_files(root)
+    files: Dict[str, Any] = {}
+    sources: Dict[str, str] = {}
+
+    for rel in sigs:
+        fp = root / rel
+        try:
+            source = fp.read_text(encoding="utf-8", errors="replace")
+        except (OSError, PermissionError):
+            continue
+        sources[rel] = source
+        ext = os.path.splitext(rel)[1].lower()
+        entry: Dict[str, Any] = {"imports": [], "exports": [], "resolved_deps": [], "imported_by": [], "refs": []}
+
+        if ext == ".py":
+            entry["imports"] = _parse_py_imports(source)
+            entry["exports"] = _parse_py_exports(source)
+        elif ext in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}:
+            entry["imports"] = _parse_js_imports(source)
+            entry["exports"] = _parse_js_exports(source)
+
+        for mod in entry["imports"]:
+            resolved = _resolve_module(mod, rel, root)
+            if resolved:
+                entry["resolved_deps"].append(resolved)
+        files[rel] = entry
+
+    for rel, entry in files.items():
+        for dep in entry.get("resolved_deps") or []:
+            target = files.get(dep)
+            if target and rel not in target.get("imported_by", []):
+                target.setdefault("imported_by", [])
+                target["imported_by"].append(rel)
+
+    all_stems: Dict[str, str] = {}
+    for rel in files:
+        stem = Path(rel).stem
+        if stem not in all_stems:
+            all_stems[stem] = rel
+    for rel, source in sources.items():
+        for stem, stem_rel in all_stems.items():
+            if stem_rel == rel or stem in _GENERIC_SKIP_STEMS:
+                continue
+            if re.search(r'\b' + re.escape(stem) + r'\b', source):
+                entry = files[rel]
+                if stem_rel not in entry.get("refs", []):
+                    entry.setdefault("refs", [])
+                    entry["refs"].append(stem_rel)
+
+    graph = {
+        "root": root_str,
+        "file_signatures": sigs,
+        "files": files,
+        "meta": {"analyzed_at": iso_now(), "file_count": len(files), "analyzer_version": 1},
+    }
+    write_json_atomic(cache_path, graph)
+
+    cg_dir = data_dir() / "codegraph"
+    if cg_dir.exists():
+        cached_files = sorted(cg_dir.glob("*.json"), key=lambda f: f.stat().st_mtime)
+        total = sum(f.stat().st_size for f in cached_files)
+        limit = CODEGRAPH_MAX_CACHE_MB * 1024 * 1024
+        while total > limit and cached_files:
+            oldest = cached_files.pop(0)
+            total -= oldest.stat().st_size
+            try:
+                oldest.unlink()
+            except OSError:
+                pass
+
+    return graph
+
+
+def query_impact(graph: Dict[str, Any], file_path: str) -> Dict[str, Any]:
+    """Query file impact from a code graph. Returns dependents, dependencies, importance."""
+    files = graph.get("files") or {}
+    target = None
+    for rel in files:
+        if rel == file_path or rel.endswith("/" + file_path) or file_path.endswith("/" + rel):
+            target = rel
+            break
+    if not target:
+        return {"file": file_path, "found": False, "dependents": [], "dependencies": []}
+
+    entry = files[target]
+    dependents = list(entry.get("imported_by") or [])
+    dependencies = list(entry.get("resolved_deps") or [])
+    refs_in = list(entry.get("refs") or [])
+
+    for rel, fentry in files.items():
+        if rel == target:
+            continue
+        if target in (fentry.get("resolved_deps") or []) and rel not in dependents:
+            dependents.append(rel)
+
+    dep_count = len(dependents)
+    importance = "high" if dep_count >= 5 else ("medium" if dep_count >= 2 else "low")
+
+    return {
+        "file": target, "found": True, "importance": importance,
+        "exports": entry.get("exports") or [],
+        "dependents": dependents, "dependencies": dependencies,
+        "references": refs_in, "dependent_count": dep_count,
+    }
+
+
+def builtin_file_impact(file_path: str, cwd: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Built-in file impact analysis for PreToolUse hook (replaces external gitnexus)."""
+    try:
+        root = Path(cwd or os.getcwd())
+        for parent in [root] + list(root.parents):
+            if (parent / ".git").exists():
+                root = parent
+                break
+
+        fp = Path(file_path)
+        if fp.is_absolute():
+            try:
+                file_rel = str(fp.relative_to(root))
+            except ValueError:
+                return None
+        else:
+            file_rel = file_path
+
+        ext = os.path.splitext(file_rel)[1].lower()
+        if ext not in {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}:
+            return None
+
+        graph = analyze_project(root)
+        return query_impact(graph, file_rel)
+    except Exception:
+        return None
+
+
+def _fallback_grep_dependents(file_path: str, cwd: str) -> List[str]:
+    """Find files that import/reference the given file using grep."""
+    basename = Path(file_path).stem
+    dependents: List[str] = []
+    patterns = [
+        f"import.*{basename}",
+        f"require.*{basename}",
+        f"from.*{basename}",
+        f"#include.*{basename}",
+    ]
+    try:
+        for pat in patterns:
+            proc = subprocess.run(
+                ["grep", "-rl", "--include=*.py", "--include=*.js", "--include=*.ts",
+                 "--include=*.jsx", "--include=*.tsx", "--include=*.sh",
+                 "-E", pat, cwd],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=10, check=False,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.strip().splitlines():
+                    abs_path = str(Path(cwd) / line) if not Path(line).is_absolute() else line
+                    if abs_path not in dependents and abs_path != str(Path(file_path).resolve()):
+                        dependents.append(abs_path)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return dependents
+
+
+def _fallback_git_log(file_path: str, cwd: str, count: int = 5) -> List[Dict[str, Any]]:
+    """Get recent git log entries for a file."""
+    entries: List[Dict[str, Any]] = []
+    try:
+        rel = os.path.relpath(file_path, cwd)
+    except Exception:
+        rel = file_path
+    try:
+        proc = subprocess.run(
+            ["git", "log", f"--max-count={count}", "--format=%H%n%an%n%ai%n%s", "--", rel],
+            cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10, check=False,
+        )
+        if proc.returncode == 0:
+            chunks = proc.stdout.strip().split("\n\n")
+            for chunk in chunks:
+                lines = chunk.strip().splitlines()
+                if len(lines) >= 4:
+                    entries.append({
+                        "hash": lines[0][:12],
+                        "author": lines[1],
+                        "date": lines[2][:10],
+                        "message": lines[3],
+                    })
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return entries
+
+
+def _fallback_grep_imports(file_path: str, cwd: str) -> List[str]:
+    """Find what this file imports/references."""
+    imports: List[str] = []
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+            content = fh.read(50000)
+    except (FileNotFoundError, PermissionError):
+        return imports
+    for pat in [
+        r'(?:import\s+(\S+))',
+        r'(?:from\s+(\S+)\s+import)',
+        r'(?:require\([\'"]([^\'"]+)[\'"]\))',
+        r'(?:#include\s+[<"]([^>"]+)[>"])',
+    ]:
+        for m in re.finditer(pat, content):
+            dep = m.group(1)
+            if dep and dep not in imports:
+                imports.append(dep)
+    return imports[:30]
+
+
+def _compute_importance(dependents: List[str], git_entries: List[Dict[str, Any]], traces: List[Dict[str, Any]]) -> str:
+    """Heuristic importance: high if many dependents or recent high-frequency changes."""
+    dep_score = min(len(dependents), 10)
+    change_freq = len(git_entries)
+    trace_freq = len(traces)
+    if dep_score >= 5 or change_freq >= 4 or trace_freq >= 20:
+        return "high"
+    if dep_score >= 2 or change_freq >= 2 or trace_freq >= 5:
+        return "medium"
+    return "low"
+
+
+def cmd_impact(args: argparse.Namespace) -> int:
+    """Show file impact analysis: dependents, dependencies, importance, risk."""
+    file_path = normalize_resource(args.path)
+    cwd = str(os.getcwd())
+
+    if not Path(file_path).exists() and not file_path.startswith(("bash:", "mcp:")):
+        eprint_identity(f"File not found: {file_path}")
+        return 1
+
+    # Try GitNexus first
+    gn = gitnexus_file_context(file_path, cwd)
+
+    # Fallback: grep for dependents
+    dependents = _fallback_grep_dependents(file_path, cwd)
+
+    # Fallback: git log
+    git_entries = _fallback_git_log(file_path, cwd, count=5)
+
+    # Fallback: what this file imports
+    dependencies = _fallback_grep_imports(file_path, cwd)
+
+    # AIDS traces for this file
+    traces = recent_traces(file_path, limit=10)
+
+    # Importance heuristic
+    importance = _compute_importance(dependents, git_entries, traces)
+    if gn and gn.get("importance") in ("high", "medium", "low"):
+        importance = gn["importance"]
+
+    result: Dict[str, Any] = {
+        "file": file_path,
+        "importance": importance,
+        "gitnexus": gn,
+        "dependents": dependents[:20],
+        "dependencies": dependencies[:20],
+        "recent_git_changes": git_entries,
+        "recent_traces": [
+            {
+                "trace_id": t.get("trace_id"),
+                "operation": t.get("operation"),
+                "by": (t.get("session") or {}).get("display_name") or t.get("session_id"),
+                "role": (t.get("session") or {}).get("role"),
+                "intent": t.get("intent"),
+                "ago": human_ago(t.get("timestamp", 0)) if isinstance(t.get("timestamp"), int) else "unknown",
+            }
+            for t in traces
+        ],
+        "dependent_count": len(dependents),
+        "dependency_count": len(dependencies),
+        "risk_note": "",
+    }
+
+    # Risk assessment
+    if importance == "high" and len(dependents) >= 3:
+        result["risk_note"] = f"HIGH RISK: {len(dependents)} files depend on this. Changes have broad impact."
+    elif importance == "medium":
+        result["risk_note"] = f"MODERATE: {len(dependents)} dependent(s). Review before modifying."
+    else:
+        result["risk_note"] = "LOW: Few or no dependents detected."
+
+    if getattr(args, "json", False):
+        print(json_dump(result))
+        return 0
+
+    # Human-readable
+    print(f"File Impact Analysis: {file_path}")
+    print(f"  Importance: {importance.upper()}")
+    print(f"  Risk:       {result['risk_note']}")
+    print()
+
+    if gn and gn.get("available"):
+        print(f"  GitNexus: {short(gn.get('summary', ''), 200)}")
+    elif gn:
+        print(f"  GitNexus: {gn.get('summary', 'unavailable')}")
+    else:
+        print("  GitNexus: disabled or not installed")
+    print()
+
+    if dependents:
+        print(f"  Dependents ({len(dependents)} files that import/reference this file):")
+        for dep in dependents[:10]:
+            try:
+                display = os.path.relpath(dep, cwd)
+            except Exception:
+                display = dep
+            print(f"    - {display}")
+        if len(dependents) > 10:
+            print(f"    ... and {len(dependents) - 10} more")
+    else:
+        print("  Dependents: none detected")
+    print()
+
+    if dependencies:
+        print(f"  Dependencies ({len(dependencies)} imports):")
+        for dep in dependencies[:10]:
+            print(f"    - {dep}")
+    print()
+
+    if git_entries:
+        print(f"  Recent git changes ({len(git_entries)}):")
+        for e in git_entries:
+            print(f"    - {e['date']} {e['author']}: {short(e['message'], 80)} ({e['hash']})")
+    else:
+        print("  Recent git changes: none (not in git or no history)")
+    print()
+
+    if traces:
+        print(f"  Recent AIDS traces ({len(traces)}):")
+        for t in traces:
+            actor = (t.get("session") or {}).get("display_name") or t.get("session_id", "?")
+            role = (t.get("session") or {}).get("role", "?")
+            op = t.get("operation", "?")
+            intent = short(t.get("intent", ""), 60)
+            ago = human_ago(t.get("timestamp", 0)) if isinstance(t.get("timestamp"), int) else "?"
+            print(f"    - {op} by {actor} ({role}) {ago}; intent: {intent}")
+    else:
+        print("  Recent AIDS traces: none")
+
+    return 0
+
+
+def cmd_commit_stamp(_: argparse.Namespace) -> int:
+    """Output git Co-Authored-By trailer with current session identity."""
+    sid = current_session_id() or "unknown"
+    role = env_first("AIDS_ROLE", "AID_ROLE", "AHA_AGENT_ROLE", "ROLE", "SELFTOOLS_ROLE", "ZHUYI_ROLE", "AHA_ROLE") or "unknown"
+    name = env_first("AIDS_DISPLAY_NAME", "AHA_SESSION_NAME", "AID_DISPLAY_NAME", "SELFTOOLS_DISPLAY_NAME", "ZHUYI_DISPLAY_NAME") or sid[:12]
+    runtime = env_first("AIDS_RUNTIME", "AID_RUNTIME", "SELFTOOLS_RUNTIME", "ZHUYI_RUNTIME") or "unknown"
+    print(f"Co-Authored-By: {name} ({role}/{runtime}) <aids:{sid}@agent>")
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     ensure_layout()
     checks = []
@@ -2243,6 +2754,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for c in checks:
             mark = "✅" if c["ok"] else "⚠️ "
             print(f"{mark} {c['name']}: {c['detail']}")
+    # Self-reference: show current session identity
+    sid = current_session_id()
+    if sid:
+        sess = load_session(sid)
+        if sess:
+            if not getattr(args, 'json', False):
+                print(f"  Identity: {sess.get('display_name', sid)} (role={sess.get('role', '?')}, runtime={sess.get('runtime', '?')})")
     return 0 if all(c["ok"] for c in checks[:3]) else 1
 
 
@@ -2366,6 +2884,14 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--resource", help="Filter by resource path")
     export.set_defaults(func=cmd_export)
 
+    impact = sub.add_parser("impact", help="Show file impact analysis (dependents, risk, importance)")
+    impact.add_argument("path", help="File path to analyze")
+    impact.add_argument("--json", action="store_true", help="JSON output")
+    impact.set_defaults(func=cmd_impact)
+
+    cs = sub.add_parser("commit-stamp", help="Output git Co-Authored-By trailer with session identity")
+    cs.set_defaults(func=cmd_commit_stamp)
+
     doctor = sub.add_parser("doctor", help="Verify installation")
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
@@ -2383,8 +2909,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except BrokenPipeError:
         return 0
     except Exception as exc:
-        append_log({"level": "error", "event": "cli_exception", "error": repr(exc)})
-        print(f"aids error: {exc}", file=sys.stderr)
+        append_log({"level": "error", "event": "cli_exception", "error": repr(exc), "session_id": current_session_id()})
+        eprint_identity(f"aids error: {exc}")
         return 1
 
 
