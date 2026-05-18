@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { normalizeFilePath } = require('../src/trace/trace');
 
 // --- Identity helpers ---
 
