@@ -193,7 +193,9 @@ test('readAllTraces defaults to a 30-day scan window with explicit days override
   assert.deepEqual(trace.readAllTraces().map((item) => item.traceId), [recent.traceId]);
   // getTraceById always scans all history (backward compat for lookups by ID)
   assert.equal(trace.getTraceById(old.traceId).traceId, old.traceId);
+  assert.equal(trace.getTraceById(old.traceId, { days: 30 }), null);
   assert.equal(trace.getTraceById(old.traceId, { days: 'all' }).traceId, old.traceId);
+  assert.deepEqual(trace.getTraceChain(old.traceId).map((item) => item.traceId), [old.traceId]);
 
   const defaultRecent = spawnSync(process.execPath, ['src/trace/trace.js', 'recent', oldFile, '--json'], {
     cwd: path.join(__dirname, '..'),
