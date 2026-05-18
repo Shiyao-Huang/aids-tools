@@ -402,6 +402,8 @@ data_dir = os.environ.get("AIDS_DATA_DIR") or os.environ.get("AIDS_HOME") or os.
 config.parent.mkdir(parents=True, exist_ok=True)
 text = config.read_text(encoding="utf-8") if config.exists() else ""
 text = re.sub(r"\n?# (?:selftools|AIDS) MCP server BEGIN\n.*?# (?:selftools|AIDS) MCP server END\n?", "\n", text, flags=re.S)
+# Also remove any unmarked [mcp_servers.aids] block from older installs
+text = re.sub(r"\n?\[mcp_servers\.aids\][^\[]*", "\n", text)
 
 def toml_str(s):
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
