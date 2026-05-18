@@ -62,7 +62,7 @@ function handle(input) {
         operation: toolName,
         filePath: key,
         purpose: identity.goal || '',
-        result: toolName === 'Bash' ? extractResult(input) : null,
+        result: extractResult(input),
       });
     } catch (e) {
       // Non-fatal: log and continue
@@ -179,12 +179,46 @@ function extractBashResources(command) {
 }
 
 /**
- * Extract a minimal result summary from the tool response.
+ * Extract a result summary from the tool response.
+ * Captures status (ok/error), exit_code, and is_error for all tools.
  */
 function extractResult(input) {
   const resp = input.tool_result || input.tool_response;
-  if (!resp) return null;
-  if (typeof resp === 'string') return { status: resp.length > 200 ? 'truncated' : 'ok', length: resp.length };
-  if (typeof resp === 'object') return { status: resp.error ? 'error' : 'ok' };
+  if (resp === undefined || resp === null) return null;
+
+  // String result (common for Bash output, tool responses)
+  if (typeof resp === 'string') {
+    const isError = input.is_error === true || input.isError === true;
+    const exitCode = parseExitCode(resp);
+    return {
+      status: isError ? 'error' : 'ok',
+      is_error: isError,
+      exit_code: exitCode,
+      length: resp.length,
+    };
+  }
+
+  // Object result
+  if (typeof resp === 'object') {
+    const isError = resp.error || resp.is_error || input.is_error === true || input.isError === true;
+    const exitCode = resp.exit_code ?? resp.exitCode ?? parseExitCode(resp.stderr || resp.stdout || '');
+    return {
+      status: isError ? 'error' : 'ok',
+      is_error: !!isError,
+      exit_code: exitCode,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Try to extract exit code from Bash output text.
+ * Common patterns: "Exit code: N" or "[error] exit code N" at the end of output.
+ */
+function parseExitCode(text) {
+  if (typeof text !== 'string' || !text) return null;
+  const m = text.match(/[Ee]xit\s+code:\s*(\d+)/);
+  if (m) return parseInt(m[1], 10);
   return null;
 }
