@@ -289,6 +289,55 @@ class TestINV3_StaleWriteProtection(AIDSTestBase):
                 f"INV-3: write trace should have pre_hash, got {tr.get('trace_id')}",
             )
 
+    def test_pending_timestamp_precedes_trace_timestamp(self) -> None:
+        """pending.timestamp 必须早于或等于对应 write trace.timestamp。"""
+        self._simulate_session_start()
+        tool_use_id = f"tu-{uuid.uuid4().hex[:8]}"
+
+        self._simulate_pre_tool_use("Edit", str(self.test_file), tool_use_id=tool_use_id)
+        pending = _read_json(self._data_dir() / "pending" / f"{tool_use_id}.json")
+        self.assertIsNotNone(pending, "INV-3: pending snapshot should exist after PreToolUse")
+        self.assertEqual(pending.get("tool_use_id"), tool_use_id)
+        self.assertIsInstance(pending.get("timestamp"), int)
+
+        self.test_file.write_text("# timestamp ordered\n", encoding="utf-8")
+        self._simulate_post_tool_use("Edit", str(self.test_file), tool_use_id=tool_use_id)
+
+        traces = self._traces_today()
+        matching = [t for t in traces if t.get("tool_use_id") == tool_use_id]
+        self.assertEqual(len(matching), 1, "INV-3: exactly one trace should match the pending tool_use_id")
+        trace = matching[0]
+        self.assertIsInstance(trace.get("timestamp"), int)
+        self.assertLessEqual(
+            pending["timestamp"], trace["timestamp"],
+            f"INV-3: pending.timestamp ({pending['timestamp']}) must be <= trace.timestamp ({trace['timestamp']})",
+        )
+
+    def test_skipping_pre_hook_does_not_create_valid_write_trace(self) -> None:
+        """跳过 PreToolUse 的攻击不应伪装成受保护的 modify/create 写 trace。"""
+        self._simulate_session_start()
+        tool_use_id = f"tu-{uuid.uuid4().hex[:8]}"
+
+        # 攻击：绕过 PreToolUse，先直接修改文件，再只触发 PostToolUse。
+        self.test_file.write_text("# bypassed pre hook\n", encoding="utf-8")
+        self._simulate_post_tool_use("Edit", str(self.test_file), tool_use_id=tool_use_id)
+
+        pending_file = self._data_dir() / "pending" / f"{tool_use_id}.json"
+        self.assertFalse(pending_file.exists(), "INV-3 attack fixture: no pending should exist when PreToolUse is skipped")
+
+        traces = self._traces_today()
+        matching = [t for t in traces if t.get("tool_use_id") == tool_use_id]
+        self.assertEqual(len(matching), 1, "PostToolUse still records an audit trace for the attempted write")
+        trace = matching[0]
+        self.assertNotIn(
+            trace.get("operation"), ("create", "modify", "delete"),
+            "INV-3: a Post-only attack must not be classified as a protected write operation",
+        )
+        self.assertEqual(
+            trace.get("pre_hash"), trace.get("post_hash"),
+            "INV-3: without PreToolUse, post hook can only observe the already-mutated state",
+        )
+
 
 # ============================================================
 # INV-4：操作链不可篡改
@@ -321,6 +370,33 @@ class TestINV4_Immutability(AIDSTestBase):
         trace_ids = [t.get("trace_id") for t in traces]
         unique_ids = set(trace_ids)
         self.assertEqual(len(trace_ids), len(unique_ids), "INV-4: all trace_ids must be unique")
+
+    def test_existing_trace_records_unchanged_after_append(self) -> None:
+        """写 N 条后再追加 1 条，前 N 条原始 JSONL 内容必须完全不变。"""
+        from datetime import date
+
+        self._simulate_session_start()
+        for i in range(3):
+            self._simulate_write_flow(str(self.test_file), f"# immutable v{i}\n")
+
+        trace_path = self._data_dir() / "traces" / f"{date.today().isoformat()}.jsonl"
+        before_lines = trace_path.read_text(encoding="utf-8").splitlines()
+        before_records = self._traces_today()
+        self.assertGreaterEqual(len(before_lines), 3, "INV-4 fixture: should have N trace records before append")
+
+        self._simulate_write_flow(str(self.test_file), "# immutable extra append\n")
+
+        after_lines = trace_path.read_text(encoding="utf-8").splitlines()
+        after_records = self._traces_today()
+        self.assertGreater(len(after_lines), len(before_lines), "INV-4: trace file should grow after append")
+        self.assertEqual(
+            after_lines[:len(before_lines)], before_lines,
+            "INV-4: previously written raw JSONL records must remain byte-for-byte unchanged after append",
+        )
+        self.assertEqual(
+            after_records[:len(before_records)], before_records,
+            "INV-4: previously parsed trace records must remain exactly unchanged after append",
+        )
 
 
 # ============================================================
@@ -475,6 +551,33 @@ class TestINV7_GoodhartProtection(AIDSTestBase):
         required = ["rating_id", "trace_id", "rater_session_id", "score", "timestamp", "timestamp_iso"]
         for field in required:
             self.assertIn(field, rating, f"INV-7: rating must have '{field}' field")
+
+    def test_same_rater_cannot_rate_same_trace_twice(self) -> None:
+        """同一 rater 对同一 trace 最多只能评分一次。"""
+        self._simulate_session_start()
+        self._simulate_write_flow(str(self.test_file), "# unique rating target\n")
+
+        traces = self._traces_today()
+        self.assertGreater(len(traces), 0)
+        trace_id = traces[0]["trace_id"]
+
+        first = _run_cli("rate", trace_id, "good", "first", "rating", env=self.env)
+        self.assertEqual(first.returncode, 0, f"First rating should succeed: {first.stderr}")
+
+        duplicate = _run_cli("rate", trace_id, "bad", "duplicate", "rating", env=self.env)
+        self.assertNotEqual(
+            duplicate.returncode, 0,
+            "INV-7: duplicate rating by the same rater for the same trace must be rejected",
+        )
+
+        ratings = [
+            r for r in self._ratings_today()
+            if r.get("trace_id") == trace_id and r.get("rater_session_id") == self.session_id
+        ]
+        self.assertEqual(
+            len(ratings), 1,
+            "INV-7: there must be at most one rating per (trace_id, rater_session_id)",
+        )
 
 
 # ============================================================
