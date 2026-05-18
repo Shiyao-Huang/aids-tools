@@ -2244,6 +2244,44 @@ class TestFileLockTTL(TempDataMixin, unittest.TestCase):
         """STALE_SECONDS should remain 300 for clean_all_stale_locks."""
         self.assertEqual(selftools.FileLock.STALE_SECONDS, 300)
 
+    def test_acquire_skips_ttl_check(self):
+        """acquire path (check_ttl=False) must NOT break a lock that is TTL-expired
+        but held by a live PID.  Only dead-PID locks should be broken."""
+        import fcntl as _fcntl
+        lock_path = selftools.data_dir() / "locks" / "test_acquire_skip_ttl.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Create a TTL-expired lock held by current (live) process
+        old_ts = selftools.now_ms() - 60_000  # 60s ago → TTL expired
+        holder_fd = open(lock_path, "a+", encoding="utf-8")
+        _fcntl.flock(holder_fd.fileno(), _fcntl.LOCK_EX)
+        holder_fd.write(json.dumps({"pid": os.getpid(), "ts": old_ts}) + "\n")
+        holder_fd.flush()
+        try:
+            lock = selftools.FileLock(lock_path, timeout=0.3, ttl=30.0)
+            # check_ttl=False → should NOT break the lock (holder is alive)
+            self.assertFalse(lock._break_stale_lock(check_ttl=False))
+            # check_ttl=True (default) → SHOULD break the lock (TTL expired)
+            self.assertTrue(lock._break_stale_lock())
+        finally:
+            _fcntl.flock(holder_fd.fileno(), _fcntl.LOCK_UN)
+            holder_fd.close()
+
+    def test_clean_locks_checks_ttl(self):
+        """clean_all_stale_locks uses mtime-based cleanup (STALE_SECONDS),
+        independent of _break_stale_lock TTL logic."""
+        import time as _time
+        locks_dir = selftools.data_dir() / "locks"
+        locks_dir.mkdir(parents=True, exist_ok=True)
+        # Create a stale lock file (old mtime)
+        stale_lock = locks_dir / "stale_clean.lock"
+        stale_lock.write_text('{"pid": 999999}', encoding="utf-8")
+        # Backdate mtime beyond STALE_SECONDS
+        old_time = _time.time() - selftools.FileLock.STALE_SECONDS - 60
+        import os as _os
+        _os.utime(stale_lock, (old_time, old_time))
+        selftools.clean_all_stale_locks()
+        self.assertFalse(stale_lock.exists())
+
 
 # ─── commit-stamp ───
 
