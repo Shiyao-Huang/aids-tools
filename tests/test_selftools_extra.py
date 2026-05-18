@@ -305,6 +305,25 @@ class TestDetectResources(unittest.TestCase):
         paths = [r for r in result if not r.startswith("bash:")]
         self.assertEqual(len(paths), 2)
 
+    def test_tee_multiple_targets(self):
+        result = selftools.detect_resources("Bash", {"command": "cat file | tee a.txt b.txt c.txt"}, "/tmp")
+        paths = [r for r in result if not r.startswith("bash:")]
+        basenames = [os.path.basename(p) for p in paths]
+        self.assertIn("a.txt", basenames)
+        self.assertIn("b.txt", basenames)
+        self.assertIn("c.txt", basenames)
+
+    def test_tee_single_target(self):
+        result = selftools.detect_resources("Bash", {"command": "echo hi | tee out.txt"}, "/tmp")
+        paths = [r for r in result if not r.startswith("bash:")]
+        self.assertTrue(any(p.endswith("/tmp/out.txt") for p in paths))
+
+    def test_redirect_dev_null_filtered(self):
+        result = selftools.detect_resources("Bash", {"command": "cmd 2>/dev/null"}, "/tmp")
+        paths = [r for r in result if not r.startswith("bash:")]
+        self.assertNotIn("/dev/null", paths)
+        self.assertEqual(len(paths), 0)
+
     def test_mcp_tool(self):
         result = selftools.detect_resources("mcp__pencil_batch_design", {"filePath": "test.pen"}, "/tmp")
         self.assertTrue(any(r.startswith("mcp:") for r in result))

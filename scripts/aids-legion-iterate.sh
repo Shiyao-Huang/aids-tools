@@ -160,13 +160,19 @@ write_spec() {
   local file="$1" runtime="$2" role="$3" name="$4" goal="$5"
   cat > "$file" <<EOF
 {
-  "runtimeType": "${runtime}",
-  "displayName": "${name}",
-  "baseRoleId": "${role}",
-  "systemPrompt": "你是 AIDS 迭代团队的 ${name}。参考 .aha/prompts/aids-iteration.md 迭代 prompt 执行任务。使用 list_tasks 查看可用任务，start_task 领取任务。完成后用 complete_task 标记。中文沟通。",
-  "responsibilities": ["执行迭代任务", "与团队协作"],
-  "permissionMode": "yolo",
-  "accessLevel": "full-access"
+  "kind": "aha.agent.v1",
+  "name": "${name}",
+  "runtime": "${runtime}",
+  "prompt": {
+    "system": "你是 AIDS 迭代团队的 ${name}。参考 .aha/prompts/aids-iteration.md 迭代 prompt 执行任务。使用 list_tasks 查看可用任务，start_task 领取任务。完成后用 complete_task 标记。中文沟通。",
+    "context": ["项目: AIDS Agent-ID System，零依赖 Python CLI"]
+  },
+  "tools": { "allow": ["*"] },
+  "permissions": { "mode": "bypassPermissions" },
+  "context": {
+    "messaging": "中文沟通，完成后报告",
+    "behavior": { "onIdle": "claim-task", "onComplete": "complete-task" }
+  }
 }
 EOF
 }

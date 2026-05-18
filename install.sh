@@ -507,6 +507,21 @@ uninstall_all() {
   run rm -f "$CLAUDE_HOME/hooks/selftools-session-start.sh" "$CLAUDE_HOME/hooks/selftools-pre-tool-use.sh" "$CLAUDE_HOME/hooks/selftools-post-tool-use.sh"
   run rm -f "$CODEX_HOME/hooks/selftools-session-start.sh" "$CODEX_HOME/hooks/selftools-pre-tool-use.sh" "$CODEX_HOME/hooks/selftools-post-tool-use.sh"
   run rm -f "$BIN_DIR/selftools" "$BIN_DIR/aids" "$BIN_DIR/aid" "$BIN_DIR/selftools-mcp" "$BIN_DIR/aids-mcp" "$BIN_DIR/aid-mcp" "$BIN_DIR/claude-selftools" "$BIN_DIR/codex-selftools" "$BIN_DIR/aids-run" "$BIN_DIR/aids-bash" "$BIN_DIR/aid-run" "$BIN_DIR/aid-bash"
+  # Remove identity artifacts from current directory and data dir
+  for f in .identity AIDS_IDENTITY.md; do
+    run rm -f "$f"
+  done
+  if [ -L ".current" ]; then
+    _target="$(readlink ".current" 2>/dev/null || true)"
+    if echo "$_target" | grep -q "aids\|selftools" 2>/dev/null; then
+      run rm -f ".current"
+    fi
+  fi
+  if [ -d "$DATA_DIR" ]; then
+    find "$DATA_DIR" -name ".identity" -type f 2>/dev/null | while read -r _f; do
+      run rm -f "$_f"
+    done
+  fi
   run rm -rf "$INSTALL_DIR"
   if [ "$PURGE_DATA" -eq 1 ]; then
     run rm -rf "$DATA_DIR"

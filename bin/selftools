@@ -756,12 +756,19 @@ def parse_bash_write_resources(command: str, cwd: str) -> List[str]:
         elif len(token) > 1 and token.startswith(">"):
             target = token[1:]
         elif token == "tee":
+            # Collect ALL non-flag arguments after tee (not just first)
             probe = index + 1
             while probe < len(tokens) and tokens[probe].startswith("-"):
                 probe += 1
-            if probe < len(tokens):
-                target = tokens[probe]
-                index = probe
+            tee_targets: List[str] = []
+            while probe < len(tokens) and tokens[probe] not in {";", "&&", "||", "|"}:
+                if not tokens[probe].startswith("-"):
+                    tee_targets.append(tokens[probe])
+                probe += 1
+            for t in tee_targets:
+                if t and not t.startswith(("-", "&")):
+                    resources.append(normalize_resource(t, cwd))
+            index = probe - 1
         elif token in {"cp", "mv"}:
             operands: List[str] = []
             probe = index + 1
@@ -774,6 +781,10 @@ def parse_bash_write_resources(command: str, cwd: str) -> List[str]:
                 index = probe - 1
 
         if target and not target.startswith(("-", "&")):
+            # Skip special device paths that produce meaningless traces
+            if target in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
+                target = None
+                continue
             resources.append(normalize_resource(target, cwd))
         index += 1
 
@@ -2801,23 +2812,53 @@ def cmd_commit_stamp(_: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     ensure_layout()
-    checks = []
-    checks.append(check("data_dir", data_dir().exists(), str(data_dir())))
-    checks.append(check("sessions_dir", (data_dir() / "sessions").exists(), str(data_dir() / "sessions")))
-    checks.append(check("traces_dir", (data_dir() / "traces").exists(), str(data_dir() / "traces")))
-    claude_settings = Path(os.environ.get("CLAUDE_HOME", str(Path.home() / ".claude"))) / "settings.json"
-    codex_hooks = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "hooks.json"
-    codex_config = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"
+    checks: List[Dict[str, Any]] = []
+    # ── Core data directories ──
+    for subdir in ("sessions", "traces", "timeline", "index", "ratings", "pending", "locks"):
+        p = data_dir() / subdir
+        checks.append(check(f"{subdir}_dir", p.exists(), str(p)))
+    # ── Runtime hook configurations ──
+    claude_home = Path(os.environ.get("CLAUDE_HOME", str(Path.home() / ".claude")))
+    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    claude_settings = claude_home / "settings.json"
+    codex_hooks_json = codex_home / "hooks.json"
+    codex_config = codex_home / "config.toml"
     checks.append(check("claude_settings", file_contains(claude_settings, "selftools") or file_contains(claude_settings, "aids"), str(claude_settings)))
-    checks.append(check("codex_hooks", file_contains(codex_hooks, "selftools") or file_contains(codex_hooks, "aids"), str(codex_hooks)))
+    checks.append(check("codex_hooks", file_contains(codex_hooks_json, "selftools") or file_contains(codex_hooks_json, "aids"), str(codex_hooks_json)))
     checks.append(check("codex_mcp", file_contains(codex_config, "mcp_servers.selftools") or file_contains(codex_config, "mcp_servers.aids"), str(codex_config)))
-    lock_mech = "fcntl.flock" if fcntl is not None else "windows/msvcrt"
+    # ── Hook scripts executable ──
+    for hook_name in ("selftools-session-start.sh", "selftools-pre-tool-use.sh", "selftools-post-tool-use.sh"):
+        for home, label in ((claude_home, "claude"), (codex_home, "codex")):
+            hp = home / "hooks" / hook_name
+            ok_exec = hp.exists() and os.access(hp, os.X_OK)
+            checks.append(check(f"{label}_hook_{hook_name}", ok_exec, str(hp)))
+    # ── CLI symlinks valid ──
+    bin_dir = Path(os.environ.get("AIDS_BIN_DIR", str(Path.home() / ".local" / "bin")))
+    for name in ("aids", "aids-mcp", "aids-run"):
+        link = bin_dir / name
+        valid = link.is_symlink() and link.resolve().exists()
+        checks.append(check(f"symlink_{name}", valid, f"{link} -> {link.resolve() if link.is_symlink() else 'missing'}"))
+    # ── Lock mechanism ──
+    lock_mech = "fcntl.flock" if fcntl is not None else "os.rename (portable)"
     checks.append(check("lock_mechanism", True, lock_mech))
     locks_dir = data_dir() / "locks"
     stale_count = sum(1 for _ in locks_dir.glob("*.lock")) if locks_dir.exists() else 0
-    checks.append(check("locks_dir", locks_dir.exists(), f"{locks_dir} ({stale_count} lock files)"))
+    checks.append(check("stale_locks", stale_count == 0, f"{stale_count} lock files in {locks_dir}"))
+    # ── config.json validity ──
+    config_path = data_dir() / "config.json"
+    config_ok = True
+    if config_path.exists():
+        try:
+            json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, Exception):
+            config_ok = False
+    checks.append(check("config_json", config_ok, str(config_path)))
+    # ── Determine overall health ──
+    critical_names = {"sessions_dir", "traces_dir", "claude_settings"}
+    critical_ok = all(c["ok"] for c in checks if c["name"] in critical_names)
+    all_ok = all(c["ok"] for c in checks)
     if args.json:
-        print(json_dump({"ok": all(c["ok"] for c in checks[:3]), "checks": checks}))
+        print(json_dump({"ok": critical_ok, "all_ok": all_ok, "checks": checks}))
     else:
         print(f"{ZH_NAME} doctor")
         for c in checks:
@@ -2830,7 +2871,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if sess:
             if not getattr(args, 'json', False):
                 print(f"  Identity: {sess.get('display_name', sid)} (role={sess.get('role', '?')}, runtime={sess.get('runtime', '?')})")
-    return 0 if all(c["ok"] for c in checks[:3]) else 1
+    return 0 if critical_ok else 1
 
 
 def check(name: str, ok: bool, detail: str) -> Dict[str, Any]:
