@@ -22,6 +22,7 @@ import io
 import json
 import os
 import re
+import shutil
 import shlex
 import socket
 import sys
@@ -1192,6 +1193,213 @@ def _iter_jsonl_lines(files: List[Path]) -> Iterable[Dict[str, Any]]:
                 continue
 
 
+EXPORT_SCHEMA_VERSION = "aids.export.v1"
+EXPORT_TYPES = ("traces", "timeline", "ratings", "sessions")
+CSV_EXPORT_TYPES = {"traces", "timeline"}
+
+
+def _validate_date_string(value: Optional[str], label: str) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        _dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be YYYY-MM-DD: {value}") from exc
+    return value
+
+
+def _export_date_range(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
+    """Return export date range; default export is all-time unless --days is set."""
+    if getattr(args, "all", False):
+        return None, None
+    date_from = _validate_date_string(getattr(args, "from_date", None), "--from")
+    date_to = _validate_date_string(getattr(args, "to_date", None), "--to")
+    if not date_from and not date_to and getattr(args, "days", None):
+        days = max(1, int(getattr(args, "days")))
+        to = _dt.date.today()
+        frm = to - _dt.timedelta(days=days - 1)
+        date_from, date_to = frm.isoformat(), to.isoformat()
+    if date_from and date_to and date_from > date_to:
+        raise ValueError(f"--from must be on or before --to: {date_from} > {date_to}")
+    return date_from, date_to
+
+
+def _record_date(record: Dict[str, Any]) -> Optional[str]:
+    """Best-effort YYYY-MM-DD date from a session or loose record."""
+    for key in ("timestamp_iso", "started_iso", "last_seen_iso"):
+        value = record.get(key)
+        if isinstance(value, str) and len(value) >= 10:
+            try:
+                return _dt.date.fromisoformat(value[:10]).isoformat()
+            except ValueError:
+                pass
+    for key in ("timestamp", "started_at", "last_seen_at"):
+        value = record.get(key)
+        if isinstance(value, (int, float)):
+            try:
+                return _dt.datetime.fromtimestamp(value / 1000.0, tz=_dt.timezone.utc).date().isoformat()
+            except (OverflowError, OSError, ValueError):
+                pass
+    return None
+
+
+def _date_matches(record: Dict[str, Any], date_from: Optional[str], date_to: Optional[str]) -> bool:
+    if not date_from and not date_to:
+        return True
+    rec_date = _record_date(record)
+    if not rec_date:
+        return False
+    if date_from and rec_date < date_from:
+        return False
+    if date_to and rec_date > date_to:
+        return False
+    return True
+
+
+def _export_type_names(type_name: str) -> List[str]:
+    if type_name == "all":
+        return list(EXPORT_TYPES)
+    if type_name not in EXPORT_TYPES:
+        raise ValueError(f"Unsupported export type: {type_name}")
+    return [type_name]
+
+
+def _normalize_export_resource(resource: Optional[str]) -> Optional[str]:
+    if not resource:
+        return None
+    return normalize_resource(resource)
+
+
+def _record_matches_filters(
+    record: Dict[str, Any],
+    kind: str,
+    session_filter: Optional[str],
+    resource_filter: Optional[str],
+) -> bool:
+    if session_filter:
+        if kind == "ratings":
+            if record.get("rater_session_id") != session_filter and record.get("session_id") != session_filter:
+                return False
+        elif record.get("session_id") != session_filter:
+            return False
+    if resource_filter:
+        if kind not in {"traces", "timeline"}:
+            return False
+        resource_value = record.get("resource_path") or record.get("resource")
+        if resource_value != resource_filter:
+            return False
+    return True
+
+
+def _load_session_export_records(
+    sessions_dir: Path,
+    date_from: Optional[str],
+    date_to: Optional[str],
+    session_filter: Optional[str],
+) -> List[Dict[str, Any]]:
+    if not sessions_dir.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    for f in sorted(sessions_dir.glob("*.json")):
+        rec = read_json(f, {})
+        if not isinstance(rec, dict) or not rec:
+            continue
+        if session_filter and rec.get("session_id") != session_filter:
+            continue
+        if not _date_matches(rec, date_from, date_to):
+            continue
+        records.append(rec)
+    return records
+
+
+def _load_export_records(
+    dd: Path,
+    kind: str,
+    date_from: Optional[str],
+    date_to: Optional[str],
+    session_filter: Optional[str],
+    resource_filter: Optional[str],
+) -> List[Dict[str, Any]]:
+    if kind == "sessions":
+        if resource_filter:
+            return []
+        return _load_session_export_records(dd / "sessions", date_from, date_to, session_filter)
+
+    directory = dd / kind
+    files = _jsonl_files_in_range(directory, date_from, date_to)
+    return [
+        rec
+        for rec in _iter_jsonl_lines(files)
+        if _record_matches_filters(rec, kind, session_filter, resource_filter)
+    ]
+
+
+def _export_metadata(
+    dd: Path,
+    fmt: str,
+    type_name: str,
+    type_names: List[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    session_filter: Optional[str],
+    resource_filter: Optional[str],
+    counts: Dict[str, int],
+) -> Dict[str, Any]:
+    total = sum(counts.values())
+    return {
+        "schema_version": EXPORT_SCHEMA_VERSION,
+        "exported_at": iso_now(),
+        "data_dir": str(dd),
+        "format": fmt,
+        "type": type_name,
+        "types": type_names,
+        "date_range": {"from": date_from, "to": date_to},
+        "filters": {"session": session_filter, "resource": resource_filter},
+        "record_count": total,
+        "record_counts": counts,
+    }
+
+
+def _open_export_output(output_path: Optional[str]) -> Tuple[Any, bool]:
+    if not output_path or output_path == "-":
+        return sys.stdout, False
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return open(path, "w", encoding="utf-8", newline=""), True
+
+
+def _csv_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json_line(value)
+    return value
+
+
+def _csv_columns(kind: str, records: List[Dict[str, Any]]) -> List[str]:
+    preferred = {
+        "traces": [
+            "trace_id", "timestamp_iso", "timestamp", "session_id", "display_name",
+            "role", "runtime", "actor_type", "tool", "operation", "resource_path",
+            "intent", "pre_hash", "post_hash", "duration_ms", "team_id", "cwd",
+            "tool_use_id", "timeline_path",
+        ],
+        "timeline": [
+            "event_id", "trace_id", "parent_trace_id", "timestamp_iso", "timestamp",
+            "session_id", "role", "runtime", "actor_type", "tool", "operation",
+            "resource", "intent",
+        ],
+    }[kind]
+    seen = set(preferred)
+    extras = sorted(
+        key
+        for rec in records
+        for key in rec.keys()
+        if key not in seen and not isinstance(rec.get(key), (dict, list))
+    )
+    return preferred + extras
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     ensure_layout()
     dd = data_dir()
@@ -1358,48 +1566,71 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    """Export trace records in JSONL, JSON, or CSV format."""
+    """Export ~/.aids records with metadata in JSON, JSONL, or flat CSV."""
     ensure_layout()
     dd = data_dir()
-    date_from, date_to = _date_range(args)
-
-    trace_files = _jsonl_files_in_range(dd / "traces", date_from, date_to)
-    fmt = getattr(args, "format", "jsonl") or "jsonl"
+    fmt = getattr(args, "format", "json") or "json"
+    type_name = getattr(args, "type", "all") or "all"
     session_filter = getattr(args, "session", None)
-    resource_filter = getattr(args, "resource", None)
+    resource_filter = _normalize_export_resource(getattr(args, "resource", None))
 
-    if resource_filter:
-        resource_filter = normalize_resource(resource_filter)
+    try:
+        date_from, date_to = _export_date_range(args)
+        type_names = _export_type_names(type_name)
+    except ValueError as exc:
+        print(f"aids export: {exc}", file=sys.stderr)
+        return 2
 
-    traces: List[Dict[str, Any]] = []
-    for tr in _iter_jsonl_lines(trace_files):
-        if session_filter and tr.get("session_id") != session_filter:
-            continue
-        if resource_filter and tr.get("resource_path") != resource_filter:
-            continue
-        traces.append(tr)
+    if fmt == "csv" and (len(type_names) != 1 or type_names[0] not in CSV_EXPORT_TYPES):
+        allowed = ", ".join(sorted(CSV_EXPORT_TYPES))
+        print(f"aids export: CSV output is only supported for one flat type: {allowed}", file=sys.stderr)
+        return 2
+
+    data: Dict[str, List[Dict[str, Any]]] = {
+        kind: _load_export_records(dd, kind, date_from, date_to, session_filter, resource_filter)
+        for kind in type_names
+    }
+    counts = {kind: len(records) for kind, records in data.items()}
+    metadata = _export_metadata(
+        dd, fmt, type_name, type_names, date_from, date_to,
+        session_filter, resource_filter, counts,
+    )
 
     output_path = getattr(args, "output", None)
-    out = open(output_path, "w", encoding="utf-8") if output_path else sys.stdout
+    out, should_close = _open_export_output(output_path)
     try:
-        if fmt == "jsonl":
-            for tr in traces:
-                out.write(json_line(tr) + "\n")
-        elif fmt == "json":
-            out.write(json.dumps(traces, ensure_ascii=False, indent=2) + "\n")
+        if fmt == "json":
+            payload: Dict[str, Any] = {"metadata": metadata}
+            payload["data"] = data if type_name == "all" else data[type_names[0]]
+            out.write(json_dump(payload) + "\n")
+        elif fmt == "jsonl":
+            out.write(json_line({"metadata": metadata}) + "\n")
+            for kind in type_names:
+                for record in data[kind]:
+                    if type_name == "all":
+                        out.write(json_line({"type": kind, "record": record}) + "\n")
+                    else:
+                        out.write(json_line(record) + "\n")
         elif fmt == "csv":
-            columns = ["trace_id", "timestamp_iso", "session_id", "tool", "resource_path", "operation", "intent", "runtime", "role"]
+            kind = type_names[0]
+            records = data[kind]
+            columns = _csv_columns(kind, records)
+            meta_columns = [
+                "export_schema_version", "exported_at", "export_type",
+                "date_from", "date_to", "record_count", "data_dir",
+            ]
             writer = csv.writer(out)
-            writer.writerow(columns)
-            for tr in traces:
-                writer.writerow([tr.get(c, "") for c in columns])
+            writer.writerow(meta_columns + columns)
+            meta_values = [
+                metadata["schema_version"], metadata["exported_at"], kind,
+                date_from or "", date_to or "", metadata["record_count"], str(dd),
+            ]
+            for record in records:
+                writer.writerow(meta_values + [_csv_value(record.get(c)) for c in columns])
     finally:
-        if output_path:
+        if should_close:
             out.close()
 
-    count = len(traces)
-    if not output_path:
-        eprint(f"Exported {count} trace(s) as {fmt}")
     return 0
 
 
@@ -1524,10 +1755,11 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD")
     stats.set_defaults(func=cmd_stats)
 
-    export = sub.add_parser("export", help="Export trace records")
-    export.add_argument("--format", choices=["jsonl", "json", "csv"], default="jsonl", help="Output format (default: jsonl)")
+    export = sub.add_parser("export", help="Export AIDS data")
+    export.add_argument("--format", choices=["json", "jsonl", "csv"], default="json", help="Output format (default: json)")
+    export.add_argument("--type", choices=["traces", "timeline", "ratings", "sessions", "all"], default="all", help="Data type to export (default: all)")
     export.add_argument("--output", help="Write to file instead of stdout")
-    export.add_argument("--days", type=int, default=7, help="Lookback window in days (default: 7)")
+    export.add_argument("--days", type=int, help="Lookback window in days (default: all time)")
     export.add_argument("--all", action="store_true", dest="all", help="All time, ignore --days")
     export.add_argument("--from", dest="from_date", help="Start date YYYY-MM-DD")
     export.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD")
