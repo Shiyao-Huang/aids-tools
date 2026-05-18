@@ -130,25 +130,83 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 class FileLock:
-    """Cross-platform advisory file lock with timeout and stale-lock cleanup.
+    """File-based lock with stale detection, timeout, and cross-platform support.
 
-    - POSIX (macOS/Linux): fcntl.flock with timeout via polling.
-    - Windows fallback: msvcrt.locking (non-blocking attempt + polling).
-    - Stale locks older than STALE_SECONDS are auto-removed before acquire.
-    - On timeout: issue a warning and proceed without the lock (non-blocking
-      for hooks — never wedge the CLI).
+    Lock files store PID + timestamp for stale-holder detection.
+    Uses fcntl.flock on Unix; os.rename() atomicity as pseudo-lock on non-fcntl.
+    Validates lock paths reside under ~/.aids/locks/ to prevent traversal.
     """
 
     STALE_SECONDS = 300  # 5 minutes
 
     def __init__(self, path: Path, timeout: float = 5.0):
-        self.path = path
+        self.path = Path(path)
         self.timeout = timeout
         self.fd: Optional[Any] = None
-        self._locked = False
+        self._owns_lock: bool = False
 
-    def _clean_stale(self) -> None:
-        """Remove lock files older than STALE_SECONDS."""
+    # ── path validation ──
+
+    def _validate_path(self) -> None:
+        """Prevent path traversal — lock must live under the locks directory."""
+        locks_dir = (data_dir() / "locks").resolve()
+        try:
+            self.path.resolve().relative_to(locks_dir)
+        except ValueError:
+            raise ValueError(
+                f"Lock path escapes locks directory: {self.path.resolve()}"
+            )
+
+    # ── PID-based stale detection ──
+
+    @staticmethod
+    def _is_pid_alive(pid: int) -> bool:
+        """Check whether *pid* is still running (signal 0 probe)."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+    def _read_lock_info(self) -> Optional[Dict[str, Any]]:
+        """Read PID/timestamp metadata from an existing lock file."""
+        try:
+            text = self.path.read_text(encoding="utf-8").strip()
+            if text:
+                return json.loads(text)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        return None
+
+    def _write_lock_info(self) -> None:
+        """Write current PID + timestamp to the lock file via *self.fd*."""
+        if self.fd is not None:
+            self.fd.seek(0)
+            self.fd.truncate()
+            self.fd.write(json_line({"pid": os.getpid(), "ts": now_ms()}) + "\n")
+            self.fd.flush()
+
+    def _break_stale_lock(self) -> bool:
+        """Remove lock file if the holder process is dead.
+
+        Returns True if the lock was stale (or absent), False if holder is alive.
+        """
+        info = self._read_lock_info()
+        if info is None:
+            return True
+        pid = info.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return True
+        if not self._is_pid_alive(pid):
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        return False
+
+    def _clean_stale_mtime(self) -> None:
+        """Fallback: remove lock files older than STALE_SECONDS (mtime-based)."""
         try:
             if self.path.exists():
                 age = time.time() - self.path.stat().st_mtime
@@ -157,73 +215,126 @@ class FileLock:
         except OSError:
             pass
 
-    def _try_acquire_posix(self) -> bool:
-        """Attempt fcntl.flock LOCK_EX | LOCK_NB. Returns True on success."""
+    # ── non-blocking acquire ──
+
+    def _try_acquire_fcntl_nb(self) -> bool:
+        """Non-blocking fcntl.flock(LOCK_EX | LOCK_NB). Returns True on success."""
+        if self.fd is None:
+            self.fd = open(self.path, "a+", encoding="utf-8")
         try:
             fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._owns_lock = True
+            self._write_lock_info()
             return True
         except (OSError, IOError):
             return False
 
-    def _try_acquire_windows(self) -> bool:
-        """Attempt msvcrt.locking acquire. Returns True on success."""
-        import msvcrt  # type: ignore
-        import os as _os
-        try:
-            self.fd.seek(0)
-            msvcrt.locking(self.fd.fileno(), msvcrt.LK_NBLCK, 1)
-            return True
-        except (OSError, IOError):
-            return False
+    def _try_acquire_rename(self) -> bool:
+        """Non-fcntl fallback: atomic lock via os.rename().
 
-    def __enter__(self) -> "FileLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._clean_stale()
+        Writes PID metadata to a temp file, then atomically renames it to the
+        lock path.  On Windows os.rename() fails if the target exists, giving
+        us an exclusive lock without fcntl/msvcrt.
+        """
+        tmp = self.path.with_suffix(f".tmp.{os.getpid()}")
         try:
-            self.fd = open(self.path, "a+", encoding="utf-8")
+            tmp.write_text(
+                json_line({"pid": os.getpid(), "ts": now_ms()}) + "\n",
+                encoding="utf-8",
+            )
+            os.rename(tmp, self.path)
+            self.fd = open(self.path, "r+", encoding="utf-8")
+            self._owns_lock = True
+            return True
         except OSError:
-            # Cannot even open lock file — proceed without lock.
-            warnings.warn(f"AIDS: cannot open lock {self.path}", stacklevel=2)
-            return self
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+            return False
 
-        deadline = time.monotonic() + self.timeout
-        try_acquire = self._try_acquire_posix if fcntl is not None else self._try_acquire_windows
+    def _try_acquire_nb(self) -> bool:
+        """Non-blocking acquire (fcntl or rename depending on platform)."""
+        if fcntl is not None:
+            return self._try_acquire_fcntl_nb()
+        return self._try_acquire_rename()
+
+    # ── public API ──
+
+    def acquire_with_timeout(self, timeout: float = 30.0) -> "FileLock":
+        """Acquire lock with *timeout* seconds. Breaks stale locks from dead holders.
+
+        Polls at ~0.5 s intervals. On timeout, performs one last stale-check
+        before raising ``TimeoutError``.
+        """
+        self._validate_path()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout
 
         while True:
-            if try_acquire():
-                self._locked = True
+            self._break_stale_lock()
+            if self._try_acquire_nb():
                 return self
-            if time.monotonic() >= deadline:
-                # Timeout — warn and proceed without lock so hooks never wedge.
-                warnings.warn(
-                    f"AIDS: lock timeout ({self.timeout}s) on {self.path}, proceeding without lock",
-                    stacklevel=2,
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if self._break_stale_lock() and self._try_acquire_nb():
+                    return self
+                raise TimeoutError(
+                    f"Lock {self.path} not acquired within {timeout}s"
                 )
+            time.sleep(min(0.5, remaining))
+
+    # ── context manager (blocking, used by append_jsonl etc.) ──
+
+    def __enter__(self) -> "FileLock":
+        self._validate_path()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        if fcntl is not None:
+            # PID-based stale check, then mtime fallback, then blocking flock.
+            self._break_stale_lock()
+            self._clean_stale_mtime()
+            self.fd = open(self.path, "a+", encoding="utf-8")
+            fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
+            self._owns_lock = True
+            self._write_lock_info()
+        else:
+            # Windows / non-fcntl: retry with stale detection up to self.timeout.
+            deadline = time.monotonic() + self.timeout
+            while True:
+                self._break_stale_lock()
+                self._clean_stale_mtime()
+                if self._try_acquire_rename():
+                    return self
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Lock {self.path} not acquired within {self.timeout}s"
+                    )
+                time.sleep(0.05)
+
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        """Release lock, close fd; safe to call even after prior errors."""
+        try:
+            if self._owns_lock and fcntl is not None and self.fd is not None:
+                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            if self.fd is not None:
                 try:
                     self.fd.close()
                 except OSError:
                     pass
                 self.fd = None
-                return self
-            time.sleep(0.05)
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self.fd is not None and self._locked:
-            try:
-                if fcntl is not None:
-                    fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
-                else:
-                    import msvcrt  # type: ignore
-                    self.fd.seek(0)
-                    msvcrt.locking(self.fd.fileno(), msvcrt.LK_UNLCK, 1)
-            except (OSError, IOError):
-                pass
-            try:
-                self.fd.close()
-            except OSError:
-                pass
-        self._locked = False
-        self.fd = None
+            # Windows / non-fcntl: remove lock file to release.
+            if self._owns_lock and fcntl is None:
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+            self._owns_lock = False
 
 
 def lock_path_for(target: Path) -> Path:
@@ -1304,6 +1415,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     checks.append(check("claude_settings", file_contains(claude_settings, "selftools") or file_contains(claude_settings, "aids"), str(claude_settings)))
     checks.append(check("codex_hooks", file_contains(codex_hooks, "selftools") or file_contains(codex_hooks, "aids"), str(codex_hooks)))
     checks.append(check("codex_mcp", file_contains(codex_config, "mcp_servers.selftools") or file_contains(codex_config, "mcp_servers.aids"), str(codex_config)))
+    lock_mech = "fcntl.flock" if fcntl is not None else "windows/msvcrt"
+    checks.append(check("lock_mechanism", True, lock_mech))
+    locks_dir = data_dir() / "locks"
+    stale_count = sum(1 for _ in locks_dir.glob("*.lock")) if locks_dir.exists() else 0
+    checks.append(check("locks_dir", locks_dir.exists(), f"{locks_dir} ({stale_count} lock files)"))
     if args.json:
         print(json_dump({"ok": all(c["ok"] for c in checks[:3]), "checks": checks}))
     else:
@@ -1407,6 +1523,17 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--from", dest="from_date", help="Start date YYYY-MM-DD")
     stats.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD")
     stats.set_defaults(func=cmd_stats)
+
+    export = sub.add_parser("export", help="Export trace records")
+    export.add_argument("--format", choices=["jsonl", "json", "csv"], default="jsonl", help="Output format (default: jsonl)")
+    export.add_argument("--output", help="Write to file instead of stdout")
+    export.add_argument("--days", type=int, default=7, help="Lookback window in days (default: 7)")
+    export.add_argument("--all", action="store_true", dest="all", help="All time, ignore --days")
+    export.add_argument("--from", dest="from_date", help="Start date YYYY-MM-DD")
+    export.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD")
+    export.add_argument("--session", help="Filter by session_id")
+    export.add_argument("--resource", help="Filter by resource path")
+    export.set_defaults(func=cmd_export)
 
     doctor = sub.add_parser("doctor", help="Verify installation")
     doctor.add_argument("--json", action="store_true")
