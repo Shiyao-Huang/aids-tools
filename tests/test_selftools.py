@@ -581,6 +581,164 @@ class TestCmdExport(TempDataMixin, unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("CSV output is only supported", captured_err.getvalue())
 
+    def test_export_json_type_traces_only(self):
+        """export --type traces returns only trace records."""
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--type", "traces"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["metadata"]["type"], "traces")
+        self.assertIsInstance(result["data"], list)
+        self.assertEqual(len(result["data"]), 1)
+        self.assertEqual(result["data"][0]["trace_id"], "tr_export_1")
+
+    def test_export_json_type_ratings_only(self):
+        """export --type ratings returns only rating records."""
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--type", "ratings"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["metadata"]["type"], "ratings")
+        self.assertIsInstance(result["data"], list)
+        self.assertEqual(len(result["data"]), 1)
+        self.assertEqual(result["data"][0]["rating_id"], "rt_export_1")
+
+    def test_export_json_type_sessions_only(self):
+        """export --type sessions returns only session records."""
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--type", "sessions"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["metadata"]["type"], "sessions")
+        self.assertIsInstance(result["data"], list)
+        self.assertEqual(len(result["data"]), 1)
+        self.assertEqual(result["data"][0]["session_id"], "export-s1")
+
+    def test_export_json_days_filter(self):
+        """export --days 1 returns today's data."""
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--days", "1"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["metadata"]["record_count"], 4)
+
+    def test_export_json_date_range_filter(self):
+        """export --from/--to filters by date."""
+        self._seed_export_data()
+        today_str = selftools.today()
+        args = selftools.build_parser().parse_args(["export", "--from", today_str, "--to", today_str])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["metadata"]["record_count"], 4)
+
+    def test_export_json_date_range_excludes_old(self):
+        """export --from far-future --to far-future returns 0 records."""
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--from", "2099-01-01", "--to", "2099-12-31"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["metadata"]["record_count"], 0)
+
+    def test_export_json_session_filter(self):
+        """export --session filters by session_id."""
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--session", "export-s1"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        # traces and timeline match session, sessions matches, ratings match
+        self.assertGreater(result["metadata"]["record_count"], 0)
+
+    def test_export_json_session_filter_no_match(self):
+        """export --session with nonexistent session returns 0 records."""
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--session", "nonexistent-session"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["metadata"]["record_count"], 0)
+
+    def test_export_json_output_to_file(self):
+        """export --output writes to a file instead of stdout."""
+        self._seed_export_data()
+        outfile = os.path.join(self._tmpdir, "export_out.json")
+        args = selftools.build_parser().parse_args(["export", "--output", outfile])
+        with patch("sys.stdout"):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(outfile))
+        with open(outfile, "r", encoding="utf-8") as f:
+            result = json.loads(f.read())
+        self.assertEqual(result["metadata"]["format"], "json")
+        self.assertEqual(result["metadata"]["record_count"], 4)
+
+    def test_export_empty_data(self):
+        """export on empty data dir does not crash."""
+        args = selftools.build_parser().parse_args(["export"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["metadata"]["record_count"], 0)
+
+    def test_export_csv_timeline(self):
+        """export --format csv --type timeline produces valid CSV."""
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--format", "csv", "--type", "timeline"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        rows = list(csv.reader(io.StringIO(captured.getvalue())))
+        self.assertGreaterEqual(len(rows), 2)  # header + at least 1 data row
+        self.assertIn("exported_at", rows[0])
+        self.assertIn("event_id", rows[0])
+        self.assertEqual(rows[1][rows[0].index("record_count")], "1")
+
+    def test_export_csv_ratings_rejected(self):
+        """export --format csv --type ratings is rejected (not flat enough)."""
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--format", "csv", "--type", "ratings"])
+        import io
+        captured_err = io.StringIO()
+        with patch("sys.stderr", captured_err):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 2)
+        self.assertIn("CSV output is only supported", captured_err.getvalue())
+
 
 class TestCmdQuery(TempDataMixin, unittest.TestCase):
     def _seed_query_data(self):
@@ -843,12 +1001,81 @@ class TestCmdDoctor(TempDataMixin, unittest.TestCase):
         data_checks = [c for c in result["checks"] if c["name"].endswith("_dir")]
         self.assertTrue(all(c["ok"] for c in data_checks), f"Data dir checks failed: {data_checks}")
 
+    def test_doctor_clean_locks_removes_stale(self):
+        """doctor --clean-locks removes stale lock files."""
+        dd = selftools.data_dir()
+        locks_dir = dd / "locks"
+        locks_dir.mkdir(parents=True, exist_ok=True)
+
+        fake_pid = 999999999
+        stale_lock = locks_dir / "test-stale.lock"
+        stale_lock.write_text(json.dumps({"pid": fake_pid, "ts": 0}), encoding="utf-8")
+        import time as _time
+        old_time = _time.time() - selftools.FileLock.STALE_SECONDS - 60
+        os.utime(stale_lock, (old_time, old_time))
+
+        self.assertTrue(stale_lock.exists())
+        args = selftools.build_parser().parse_args(["doctor", "--clean-locks", "--json"])
+        import io
+        captured = io.StringIO()
+        # Prevent ensure_layout's clean_all_stale_locks from removing lock before doctor scans
+        with patch.object(selftools, "clean_all_stale_locks"):
+            with patch("sys.stdout", captured):
+                rc = selftools.cmd_doctor(args)
+        result = json.loads(captured.getvalue())
+        clean_check = [c for c in result["checks"] if c["name"] == "clean_locks"]
+        self.assertEqual(len(clean_check), 1)
+        self.assertTrue(clean_check[0]["ok"])
+        self.assertIn("removed 1/1", clean_check[0]["detail"])
+        self.assertFalse(stale_lock.exists(), "Stale lock should be deleted")
+
+    def test_doctor_clean_locks_preserves_active(self):
+        """doctor --clean-locks keeps active (current PID) lock files."""
+        dd = selftools.data_dir()
+        locks_dir = dd / "locks"
+        locks_dir.mkdir(parents=True, exist_ok=True)
+
+        active_lock = locks_dir / "test-active.lock"
+        active_lock.write_text(json.dumps({"pid": os.getpid(), "ts": selftools.now_ms()}), encoding="utf-8")
+
+        args = selftools.build_parser().parse_args(["doctor", "--clean-locks", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_doctor(args)
+        result = json.loads(captured.getvalue())
+        self.assertTrue(active_lock.exists(), "Active lock should be preserved")
+        clean_check = [c for c in result["checks"] if c["name"] == "clean_locks"]
+        self.assertEqual(len(clean_check), 0)
+
+    def test_doctor_without_clean_locks_no_deletion(self):
+        """doctor without --clean-locks does NOT delete stale locks."""
+        dd = selftools.data_dir()
+        locks_dir = dd / "locks"
+        locks_dir.mkdir(parents=True, exist_ok=True)
+
+        fake_pid = 999999999
+        stale_lock = locks_dir / "test-noclean.lock"
+        stale_lock.write_text(json.dumps({"pid": fake_pid, "ts": 0}), encoding="utf-8")
+        import time as _time
+        old_time = _time.time() - selftools.FileLock.STALE_SECONDS - 60
+        os.utime(stale_lock, (old_time, old_time))
+
+        args = selftools.build_parser().parse_args(["doctor", "--json"])
+        import io
+        captured = io.StringIO()
+        # Prevent ensure_layout's clean_all_stale_locks from removing lock before doctor scans
+        with patch.object(selftools, "clean_all_stale_locks"):
+            with patch("sys.stdout", captured):
+                rc = selftools.cmd_doctor(args)
+        self.assertTrue(stale_lock.exists(), "Without --clean-locks, stale lock should remain")
+
 
 class TestBuildParser(unittest.TestCase):
     def test_all_subcommands_registered(self):
         p = selftools.build_parser()
         # Parse each subcommand to verify it exists
-        for cmd in ["stats", "export", "q", "query", "ask", "timeline", "doctor", "list-sessions", "who-touched", "op-chain", "rate", "heartbeat", "whois", "session-info", "retire-session", "register-session"]:
+        for cmd in ["stats", "export", "q", "query", "ask", "timeline", "doctor", "list-sessions", "who-touched", "op-chain", "rate", "heartbeat", "whois", "session-info", "retire-session", "register-session", "commit-stamp", "verify", "impact"]:
             if cmd == "session-info":
                 args = p.parse_args([cmd, "test-id"])
             elif cmd == "retire-session":
@@ -865,6 +1092,8 @@ class TestBuildParser(unittest.TestCase):
                 args = p.parse_args([cmd, "/tmp/test"])
             elif cmd == "rate":
                 args = p.parse_args([cmd, "tr_001", "good"])
+            elif cmd == "impact":
+                args = p.parse_args([cmd, "/tmp/test"])
             else:
                 args = p.parse_args([cmd])
             self.assertTrue(hasattr(args, "func"), f"Subcommand '{cmd}' missing func")
@@ -1937,6 +2166,215 @@ class TestRegisterSessionRuntimeBackfill(TempDataMixin, unittest.TestCase):
             os.environ.pop("AIDS_SESSION_ID", None)
             os.environ.pop("AIDS_DISPLAY_NAME", None)
             os.environ.pop("AIDS_ROLE", None)
+
+
+# ─── FileLock TTL + timeout ───
+
+
+class TestFileLockTTL(TempDataMixin, unittest.TestCase):
+    def test_default_ttl_is_30(self):
+        """FileLock.DEFAULT_TTL should be 30 seconds."""
+        self.assertEqual(selftools.FileLock.DEFAULT_TTL, 30)
+
+    def test_expired_lock_is_broken(self):
+        """A lock file with an expired timestamp should be broken."""
+        lock_path = selftools.data_dir() / "locks" / "test_ttl.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Write a lock with an old timestamp (expired)
+        old_ts = selftools.now_ms() - 60_000  # 60 seconds ago
+        lock_path.write_text(
+            json.dumps({"pid": 999999, "ts": old_ts}) + "\n",
+            encoding="utf-8",
+        )
+        lock = selftools.FileLock(lock_path, timeout=1.0, ttl=30.0)
+        self.assertTrue(lock._break_stale_lock())
+
+    def test_is_lock_expired_true_for_old_lock(self):
+        """_is_lock_expired returns True for locks older than TTL."""
+        lock_path = selftools.data_dir() / "locks" / "test_expired.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        old_ts = selftools.now_ms() - 120_000  # 2 minutes ago
+        lock_path.write_text(
+            json.dumps({"pid": 999999, "ts": old_ts}) + "\n",
+            encoding="utf-8",
+        )
+        lock = selftools.FileLock(lock_path, timeout=1.0, ttl=30.0)
+        self.assertTrue(lock._is_lock_expired())
+
+    def test_is_lock_expired_false_for_recent_lock(self):
+        """_is_lock_expired returns False for locks within TTL."""
+        lock_path = selftools.data_dir() / "locks" / "test_recent.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        recent_ts = selftools.now_ms() - 1_000  # 1 second ago
+        lock_path.write_text(
+            json.dumps({"pid": 999999, "ts": recent_ts}) + "\n",
+            encoding="utf-8",
+        )
+        lock = selftools.FileLock(lock_path, timeout=1.0, ttl=30.0)
+        self.assertFalse(lock._is_lock_expired())
+
+    def test_context_manager_acquires_lock(self):
+        """Context manager successfully acquires and releases a lock."""
+        lock_path = selftools.data_dir() / "locks" / "test_ctx.lock"
+        lock = selftools.FileLock(lock_path, timeout=2.0)
+        with lock:
+            self.assertTrue(lock._owns_lock)
+        self.assertFalse(lock._owns_lock)
+
+    def test_context_manager_timeout_on_held_lock(self):
+        """Context manager raises TimeoutError when lock is held by live process."""
+        import fcntl as _fcntl
+        lock_path = selftools.data_dir() / "locks" / "test_timeout.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Simulate a live holder: open and flock the file
+        holder_fd = open(lock_path, "a+", encoding="utf-8")
+        _fcntl.flock(holder_fd.fileno(), _fcntl.LOCK_EX)
+        holder_fd.write(json.dumps({"pid": os.getpid(), "ts": selftools.now_ms()}) + "\n")
+        holder_fd.flush()
+        try:
+            lock = selftools.FileLock(lock_path, timeout=0.3, ttl=60.0)
+            with self.assertRaises(TimeoutError):
+                with lock:
+                    pass
+        finally:
+            _fcntl.flock(holder_fd.fileno(), _fcntl.LOCK_UN)
+            holder_fd.close()
+
+    def test_stale_lock_class_constant_preserved(self):
+        """STALE_SECONDS should remain 300 for clean_all_stale_locks."""
+        self.assertEqual(selftools.FileLock.STALE_SECONDS, 300)
+
+
+# ─── commit-stamp ───
+
+
+class TestCmdCommitStamp(TempDataMixin, unittest.TestCase):
+    def _seed_session_and_traces(self, session_id="stamp-s1"):
+        """Seed a session + traces for commit-stamp testing."""
+        dd = selftools.data_dir()
+        session = {
+            "session_id": session_id,
+            "runtime": "claude",
+            "role": "implementer",
+            "status": "active",
+            "display_name": "StampAgent",
+        }
+        selftools.write_json_atomic(dd / "sessions" / f"{session_id}.json", session)
+        # Write traces
+        today_file = selftools.traces_file_for_today()
+        for i in range(3):
+            trace = {
+                "trace_id": f"tr_stamp_{i}",
+                "session_id": session_id,
+                "tool": "Write",
+                "resource_path": f"/tmp/file_{i}.py",
+                "operation": "modify",
+                "intent": "test stamp",
+                "timestamp": selftools.now_ms(),
+                "timestamp_iso": selftools.iso_now(),
+                "runtime": "claude",
+                "actor_type": "agent",
+                "chain_hash": f"hash_{i}",
+            }
+            selftools.append_jsonl(today_file, trace)
+
+    def test_commit_stamp_human_output(self):
+        """commit-stamp prints Co-Authored-By trailer in human mode."""
+        self._seed_session_and_traces("stamp-human")
+        os.environ["AIDS_SESSION_ID"] = "stamp-human"
+        os.environ["AIDS_DISPLAY_NAME"] = "StampBot"
+        os.environ["AIDS_ROLE"] = "implementer"
+        os.environ["AIDS_RUNTIME"] = "claude"
+        try:
+            args = selftools.build_parser().parse_args(["commit-stamp"])
+            import io
+            captured = io.StringIO()
+            with patch("sys.stdout", captured):
+                rc = selftools.cmd_commit_stamp(args)
+            self.assertEqual(rc, 0)
+            output = captured.getvalue()
+            self.assertIn("Co-Authored-By:", output)
+            self.assertIn("StampBot", output)
+            self.assertIn("AIDS-Trace-Summary:", output)
+            self.assertIn("AIDS-Last-Trace:", output)
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
+            os.environ.pop("AIDS_RUNTIME", None)
+
+    def test_commit_stamp_json_output(self):
+        """commit-stamp --json returns structured JSON with trace summary."""
+        self._seed_session_and_traces("stamp-json")
+        os.environ["AIDS_SESSION_ID"] = "stamp-json"
+        os.environ["AIDS_DISPLAY_NAME"] = "JsonBot"
+        os.environ["AIDS_ROLE"] = "implementer"
+        os.environ["AIDS_RUNTIME"] = "claude"
+        try:
+            args = selftools.build_parser().parse_args(["commit-stamp", "--json"])
+            import io
+            captured = io.StringIO()
+            with patch("sys.stdout", captured):
+                rc = selftools.cmd_commit_stamp(args)
+            self.assertEqual(rc, 0)
+            result = json.loads(captured.getvalue())
+            self.assertIn("trailer", result)
+            self.assertIn("JsonBot", result["trailer"])
+            self.assertEqual(result["session_id"], "stamp-json")
+            self.assertEqual(result["trace_summary"]["trace_count"], 3)
+            self.assertEqual(result["trace_summary"]["unique_resources"], 3)
+            self.assertTrue(result["trace_summary"]["chain_signed"])
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
+            os.environ.pop("AIDS_RUNTIME", None)
+
+    def test_commit_stamp_no_traces(self):
+        """commit-stamp works even with no traces (just shows trailer)."""
+        os.environ["AIDS_SESSION_ID"] = "stamp-empty"
+        os.environ["AIDS_DISPLAY_NAME"] = "EmptyBot"
+        os.environ["AIDS_ROLE"] = "tester"
+        os.environ["AIDS_RUNTIME"] = "bash"
+        try:
+            args = selftools.build_parser().parse_args(["commit-stamp"])
+            import io
+            captured = io.StringIO()
+            with patch("sys.stdout", captured):
+                rc = selftools.cmd_commit_stamp(args)
+            self.assertEqual(rc, 0)
+            output = captured.getvalue()
+            self.assertIn("Co-Authored-By:", output)
+            self.assertIn("EmptyBot", output)
+            self.assertNotIn("AIDS-Trace-Summary:", output)
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
+            os.environ.pop("AIDS_RUNTIME", None)
+
+    def test_commit_stamp_json_no_traces(self):
+        """commit-stamp --json with no traces shows zero counts."""
+        os.environ["AIDS_SESSION_ID"] = "stamp-nodata"
+        os.environ["AIDS_DISPLAY_NAME"] = "NoDataBot"
+        os.environ["AIDS_ROLE"] = "tester"
+        os.environ["AIDS_RUNTIME"] = "bash"
+        try:
+            args = selftools.build_parser().parse_args(["commit-stamp", "--json"])
+            import io
+            captured = io.StringIO()
+            with patch("sys.stdout", captured):
+                rc = selftools.cmd_commit_stamp(args)
+            self.assertEqual(rc, 0)
+            result = json.loads(captured.getvalue())
+            self.assertEqual(result["trace_summary"]["trace_count"], 0)
+            self.assertEqual(result["trace_summary"]["unique_resources"], 0)
+            self.assertFalse(result["trace_summary"]["chain_signed"])
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
+            os.environ.pop("AIDS_RUNTIME", None)
 
 
 if __name__ == "__main__":
