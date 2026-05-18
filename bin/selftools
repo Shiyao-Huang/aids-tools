@@ -1501,6 +1501,436 @@ def _csv_columns(kind: str, records: List[Dict[str, Any]]) -> List[str]:
     return preferred + extras
 
 
+QUERY_SCHEMA_VERSION = "aids.query.v1"
+DEFAULT_QUERY_CONFIG: Dict[str, Any] = {
+    "query": {
+        "enabled_modules": ["identity", "history", "signature", "impact", "ratings"],
+        "default_limit": 5,
+        "compact": True,
+    },
+    "output": {"max_chars": 1200, "intent_max": 80},
+    "signature": {"enabled": True, "strategy": "hash_chain"},
+    "impact": {"enabled": True, "provider": "gitnexus", "fallback": "grep"},
+}
+QUERY_MODULE_ALIASES = {"file_chain": "history"}
+
+
+def _deep_copy_jsonable(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
+def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = _deep_copy_jsonable(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_aids_config() -> Dict[str, Any]:
+    """Load ~/.aids/config.json and merge it over built-in defaults."""
+    path = data_dir() / "config.json"
+    raw = read_json(path, {})
+    if isinstance(raw, dict):
+        return _deep_merge_dict(DEFAULT_QUERY_CONFIG, raw)
+    return _deep_copy_jsonable(DEFAULT_QUERY_CONFIG)
+
+
+def _split_csv_words(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r"[,\s]+", value)
+    elif isinstance(value, list):
+        parts = [str(v) for v in value]
+    else:
+        parts = [str(value)]
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _normalize_query_module(name: str) -> str:
+    clean = str(name or "").strip()
+    return QUERY_MODULE_ALIASES.get(clean, clean)
+
+
+def _query_limit(args: argparse.Namespace, config: Dict[str, Any]) -> int:
+    if getattr(args, "limit", None):
+        return max(1, int(args.limit))
+    qcfg = config.get("query") if isinstance(config.get("query"), dict) else {}
+    try:
+        return max(1, int(qcfg.get("default_limit") or RECENT_LIMIT))
+    except (TypeError, ValueError):
+        return RECENT_LIMIT
+
+
+def _query_enabled_modules(args: argparse.Namespace, config: Dict[str, Any]) -> List[str]:
+    qcfg = config.get("query") if isinstance(config.get("query"), dict) else {}
+    if getattr(args, "include", None):
+        modules = _split_csv_words(args.include)
+    else:
+        modules = _split_csv_words(qcfg.get("enabled_modules") or DEFAULT_QUERY_CONFIG["query"]["enabled_modules"])
+    exclude = set(_normalize_query_module(m) for m in _split_csv_words(getattr(args, "exclude", None)))
+    out: List[str] = []
+    for module in modules:
+        name = _normalize_query_module(module)
+        if name in exclude or name not in QUERY_RESOLVERS:
+            continue
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def _query_text(args: argparse.Namespace) -> str:
+    raw = getattr(args, "target", "")
+    if isinstance(raw, list):
+        return " ".join(str(x) for x in raw).strip()
+    return str(raw or "").strip()
+
+
+def _query_tokens(query: str) -> List[str]:
+    return [tok.strip(" \t\r\n'\"`，,。:：;；()[]{}<>") for tok in query.split() if tok.strip()]
+
+
+def read_rating(rating_id: str) -> Optional[Dict[str, Any]]:
+    for rating in _iter_jsonl_lines(_jsonl_files_in_range(data_dir() / "ratings", None, None)):
+        if rating.get("rating_id") == rating_id:
+            return rating
+    return None
+
+
+def ratings_for_trace(trace_id: str) -> List[Dict[str, Any]]:
+    return [
+        rating
+        for rating in _iter_jsonl_lines(_jsonl_files_in_range(data_dir() / "ratings", None, None))
+        if rating.get("trace_id") == trace_id
+    ]
+
+
+def session_traces(session_id: str, limit: int) -> List[Dict[str, Any]]:
+    traces = [
+        trace
+        for trace in _iter_jsonl_lines(_jsonl_files_in_range(data_dir() / "traces", None, None))
+        if trace.get("session_id") == session_id
+    ]
+    traces.sort(key=lambda tr: int(tr.get("timestamp") or 0))
+    return traces[-limit:]
+
+
+def _all_sessions() -> List[Dict[str, Any]]:
+    sessions_dir = data_dir() / "sessions"
+    if not sessions_dir.exists():
+        return []
+    out = []
+    for path in sorted(sessions_dir.glob("*.json")):
+        rec = read_json(path, {})
+        if isinstance(rec, dict) and rec:
+            out.append(rec)
+    return out
+
+
+def _compact_trace(trace: Dict[str, Any], intent_max: int = 80) -> Dict[str, Any]:
+    return {
+        "trace_id": trace.get("trace_id") or trace.get("traceId"),
+        "timestamp_iso": trace.get("timestamp_iso") or trace.get("timestamp"),
+        "operation": trace.get("operation"),
+        "tool": trace.get("tool"),
+        "session_id": trace.get("session_id") or trace.get("sessionId"),
+        "role": trace.get("role"),
+        "runtime": trace.get("runtime"),
+        "resource_path": trace.get("resource_path") or trace.get("filePath"),
+        "intent": short(trace.get("intent") or trace.get("purpose"), intent_max),
+    }
+
+
+def detect_query_target(query: str) -> Dict[str, Any]:
+    tokens = _query_tokens(query)
+    probe = tokens[0] if tokens else ""
+    for tok in tokens:
+        if tok.startswith("tr_"):
+            return {"kind": "trace", "query": query, "id": tok, "record": read_trace(tok)}
+        if tok.startswith("rt_"):
+            return {"kind": "rating", "query": query, "id": tok, "record": read_rating(tok)}
+
+    for tok in tokens:
+        session = load_session(tok)
+        if session:
+            return {"kind": "session", "query": query, "id": tok, "record": session}
+
+    for tok in tokens:
+        p = Path(tok).expanduser()
+        resource = normalize_resource(tok)
+        if p.exists() or load_index(resource).get("trace_ids"):
+            return {"kind": "file", "query": query, "id": tok, "resource": resource, "exists": p.exists()}
+
+    return {"kind": "unknown", "query": query, "id": probe}
+
+
+def _fuzzy_sessions(query: str, limit: int) -> List[Dict[str, Any]]:
+    needle = query.lower()
+    matches = []
+    for session in _all_sessions():
+        hay = " ".join(str(session.get(k) or "") for k in ("session_id", "display_name", "role", "goal", "task_id")).lower()
+        if needle and needle in hay:
+            matches.append(session)
+    return matches[:limit]
+
+
+def _fuzzy_traces(query: str, limit: int) -> List[Dict[str, Any]]:
+    needle = query.lower()
+    matches = []
+    for trace in _iter_jsonl_lines(_jsonl_files_in_range(data_dir() / "traces", None, None)):
+        hay = " ".join(str(trace.get(k) or "") for k in ("trace_id", "session_id", "resource_path", "intent", "tool", "operation")).lower()
+        if needle and needle in hay:
+            matches.append(trace)
+    matches.sort(key=lambda tr: int(tr.get("timestamp") or 0))
+    return matches[-limit:]
+
+
+def resolve_identity(target: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    limit = int(ctx["limit"])
+    record = target.get("record") if isinstance(target.get("record"), dict) else {}
+    sessions: List[Dict[str, Any]] = []
+    if target["kind"] == "session" and record:
+        sessions.append(record)
+    elif target["kind"] == "trace" and record:
+        sid = str(record.get("session_id") or "")
+        if sid:
+            sessions.append(load_session(sid) or {"session_id": sid})
+    elif target["kind"] == "rating" and record:
+        sid = str(record.get("rater_session_id") or record.get("session_id") or "")
+        if sid:
+            sessions.append(load_session(sid) or {"session_id": sid})
+    elif target["kind"] == "file":
+        traces = recent_traces(str(target.get("resource")), limit=1)
+        if traces:
+            sid = str(traces[-1].get("session_id") or "")
+            sessions.append(load_session(sid) or {"session_id": sid})
+    elif target["kind"] == "unknown":
+        sessions.extend(_fuzzy_sessions(str(target.get("query") or ""), limit))
+
+    current = current_session_id()
+    items = []
+    if current:
+        items.append({"relation": "current", **(load_session(current) or {"session_id": current})})
+    for session in sessions[:limit]:
+        items.append({"relation": "target", **session})
+    summary = "No matching identity found."
+    if items:
+        first = items[0]
+        summary = f"{first.get('relation')}: {first.get('display_name') or first.get('session_id')} ({first.get('role', 'unknown')}/{first.get('runtime', 'unknown')})"
+    return {"module": "identity", "status": "ok" if items else "no_data", "summary": summary, "items": items}
+
+
+def resolve_history(target: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    limit = int(ctx["limit"])
+    intent_max = int(ctx["config"].get("output", {}).get("intent_max", 80))
+    traces: List[Dict[str, Any]] = []
+    if target["kind"] == "file":
+        traces = recent_traces(str(target.get("resource")), limit=limit)
+    elif target["kind"] == "trace" and target.get("record"):
+        traces = [target["record"]]
+    elif target["kind"] == "rating" and target.get("record"):
+        trace = read_trace(str(target["record"].get("trace_id") or ""))
+        traces = [trace] if trace else []
+    elif target["kind"] == "session":
+        traces = session_traces(str(target.get("id") or ""), limit)
+    else:
+        traces = _fuzzy_traces(str(target.get("query") or ""), limit)
+
+    items = [_compact_trace(trace, intent_max=intent_max) for trace in traces if trace]
+    summary = f"{len(items)} recent trace(s)." if items else "No matching history."
+    return {"module": "history", "status": "ok" if items else "no_data", "summary": summary, "items": items}
+
+
+def _signature_for_trace(trace: Dict[str, Any]) -> Dict[str, Any]:
+    pre_hash = trace.get("pre_hash")
+    post_hash = trace.get("post_hash")
+    if pre_hash or post_hash:
+        status = "hash_present"
+    else:
+        status = "unsigned"
+    return {"trace_id": trace.get("trace_id"), "status": status, "pre_hash": pre_hash, "post_hash": post_hash}
+
+
+def resolve_signature(target: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    sig_cfg = ctx["config"].get("signature", {}) if isinstance(ctx["config"].get("signature"), dict) else {}
+    if sig_cfg.get("enabled", True) is False:
+        return {"module": "signature", "status": "disabled", "summary": "Signature module disabled.", "items": []}
+    strategy = sig_cfg.get("strategy") or "hash_chain"
+    limit = int(ctx["limit"])
+    items: List[Dict[str, Any]] = []
+    summary = "No signature target."
+    if target["kind"] == "trace" and target.get("record"):
+        items.append(_signature_for_trace(target["record"]))
+    elif target["kind"] == "file":
+        resource = str(target.get("resource"))
+        traces = recent_traces(resource, limit=limit)
+        items = [_signature_for_trace(trace) for trace in traces]
+        current_hash = sha256_file(Path(resource))
+        last_hash = traces[-1].get("post_hash") if traces else None
+        if last_hash and current_hash:
+            summary = "current file matches last recorded hash." if last_hash == current_hash else "current file differs from last recorded hash."
+        elif items:
+            summary = "recent traces found, but no comparable file hash."
+    if not items and summary == "No signature target.":
+        summary = "No signature/hash-chain evidence found."
+    elif items and summary == "No signature target.":
+        summary = f"{sum(1 for item in items if item.get('status') == 'hash_present')} trace hash signature(s) present."
+    return {"module": "signature", "status": "ok" if items else "no_data", "summary": f"{strategy}: {summary}", "items": items}
+
+
+def _grep_impact(resource: str, limit: int) -> Dict[str, Any]:
+    basename = Path(resource).name
+    if not basename:
+        return {"provider": "grep", "matches": []}
+    root = Path.cwd()
+    ignored = {".git", ".aha", ".aids", "node_modules", "__pycache__"}
+    matches = []
+    scanned = 0
+    for path in root.rglob("*"):
+        if len(matches) >= limit:
+            break
+        if any(part in ignored for part in path.parts):
+            continue
+        if not path.is_file() or path.stat().st_size > 512_000:
+            continue
+        scanned += 1
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if basename in text:
+            matches.append(str(path.relative_to(root)))
+    return {"provider": "grep", "scanned_files": scanned, "matches": matches}
+
+
+def resolve_impact(target: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    impact_cfg = ctx["config"].get("impact", {}) if isinstance(ctx["config"].get("impact"), dict) else {}
+    if impact_cfg.get("enabled", True) is False:
+        return {"module": "impact", "status": "disabled", "summary": "Impact module disabled.", "items": []}
+    limit = int(ctx["limit"])
+    resource = ""
+    if target["kind"] == "file":
+        resource = str(target.get("resource") or "")
+    elif target["kind"] == "trace" and target.get("record"):
+        resource = str(target["record"].get("resource_path") or "")
+    if not resource or resource.startswith(("bash:", "mcp:")):
+        return {"module": "impact", "status": "no_data", "summary": "No file impact target.", "items": []}
+
+    provider = impact_cfg.get("provider") or "gitnexus"
+    items: List[Dict[str, Any]] = []
+    summary = ""
+    if provider == "gitnexus":
+        gn = gitnexus_file_context(resource)
+        if gn and gn.get("available") and "multiple repositories indexed" not in str(gn.get("summary", "")).lower():
+            items.append(gn)
+            summary = f"gitnexus importance={gn.get('importance')}"
+        else:
+            if gn:
+                items.append(gn)
+            provider = impact_cfg.get("fallback") or "grep"
+    if provider == "grep":
+        grep_result = _grep_impact(resource, limit)
+        items.append(grep_result)
+        summary = f"grep fallback found {len(grep_result.get('matches') or [])} reference(s)."
+    return {"module": "impact", "status": "ok" if items else "no_data", "summary": summary or "No impact data.", "items": items}
+
+
+def resolve_ratings(target: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    limit = int(ctx["limit"])
+    ratings: List[Dict[str, Any]] = []
+    if target["kind"] == "trace":
+        ratings = ratings_for_trace(str(target.get("id") or ""))
+    elif target["kind"] == "rating" and target.get("record"):
+        ratings = [target["record"]]
+    elif target["kind"] == "file":
+        traces = recent_traces(str(target.get("resource")), limit=limit)
+        trace_ids = {str(trace.get("trace_id")) for trace in traces if trace.get("trace_id")}
+        ratings = [
+            rating
+            for rating in _iter_jsonl_lines(_jsonl_files_in_range(data_dir() / "ratings", None, None))
+            if rating.get("trace_id") in trace_ids
+        ]
+    elif target["kind"] == "session":
+        sid = str(target.get("id") or "")
+        ratings = [
+            rating
+            for rating in _iter_jsonl_lines(_jsonl_files_in_range(data_dir() / "ratings", None, None))
+            if rating.get("rater_session_id") == sid or rating.get("session_id") == sid
+        ]
+    dist: Dict[str, int] = {}
+    for rating in ratings:
+        score = str(rating.get("score") or "unknown")
+        dist[score] = dist.get(score, 0) + 1
+    items = ratings[-limit:]
+    summary = f"{len(ratings)} rating(s): {dist}" if ratings else "No ratings found."
+    return {"module": "ratings", "status": "ok" if ratings else "no_data", "summary": summary, "distribution": dist, "items": items}
+
+
+QUERY_RESOLVERS = {
+    "identity": resolve_identity,
+    "history": resolve_history,
+    "signature": resolve_signature,
+    "impact": resolve_impact,
+    "ratings": resolve_ratings,
+}
+
+
+def _query_target_public(target: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in target.items() if k != "record"}
+
+
+def format_query_text(payload: Dict[str, Any], *, full: bool, max_chars: int) -> str:
+    icons = {"identity": "👤", "history": "📜", "signature": "✍️", "impact": "💥", "ratings": "⭐"}
+    target = payload.get("target", {})
+    lines = [f"🧭 AIDS query: {payload.get('query')} ({target.get('kind', 'unknown')})"]
+    for result in payload.get("results", []):
+        module = result.get("module")
+        lines.append(f"{icons.get(module, '•')} {module}: {result.get('summary')}")
+        if full:
+            for item in result.get("items", [])[: payload.get("limit", RECENT_LIMIT)]:
+                lines.append(f"  - {json_line(item)}")
+    text = "\n".join(lines)
+    if not full and max_chars > 0 and len(text) > max_chars:
+        return text[: max_chars - 2].rstrip() + "…\n"
+    return text + "\n"
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    ensure_layout()
+    config = load_aids_config()
+    query = _query_text(args)
+    target = detect_query_target(query)
+    limit = _query_limit(args, config)
+    modules = _query_enabled_modules(args, config)
+    ctx = {"config": config, "limit": limit, "full": bool(getattr(args, "full", False)), "query": query}
+    results = []
+    for module in modules:
+        resolver = QUERY_RESOLVERS[module]
+        try:
+            results.append(resolver(target, ctx))
+        except Exception as exc:
+            results.append({"module": module, "status": "error", "summary": str(exc), "items": []})
+    payload = {
+        "schema_version": QUERY_SCHEMA_VERSION,
+        "query": query,
+        "target": _query_target_public(target),
+        "limit": limit,
+        "modules": modules,
+        "results": results,
+        "config_path": str(data_dir() / "config.json"),
+    }
+    if args.json:
+        print(json_dump(payload))
+    else:
+        output_cfg = config.get("output") if isinstance(config.get("output"), dict) else {}
+        max_chars = int(output_cfg.get("max_chars") or 1200)
+        print(format_query_text(payload, full=bool(getattr(args, "full", False)), max_chars=max_chars), end="")
+    return 0
+
+
 def cmd_stats(args: argparse.Namespace) -> int:
     ensure_layout()
     dd = data_dir()
@@ -1835,6 +2265,20 @@ def build_parser() -> argparse.ArgumentParser:
     oc.add_argument("--limit", type=int, default=50)
     oc.add_argument("--json", action="store_true")
     oc.set_defaults(func=cmd_op_chain)
+
+    for q_name, q_help in [
+        ("q", "Low-friction query router for files/traces/sessions"),
+        ("query", "Query AIDS data with configurable resolver modules"),
+        ("ask", "Natural-language query entrypoint (rule-based, no LLM)"),
+    ]:
+        qp = sub.add_parser(q_name, help=q_help)
+        qp.add_argument("target", nargs="+", help="Target text, path, trace id, rating id, or session id")
+        qp.add_argument("--json", action="store_true", help="JSON output")
+        qp.add_argument("--full", action="store_true", help="Expand resolver details")
+        qp.add_argument("--limit", type=int, help="Maximum items per resolver")
+        qp.add_argument("--include", help="Comma-separated resolver modules to include")
+        qp.add_argument("--exclude", help="Comma-separated resolver modules to exclude")
+        qp.set_defaults(func=cmd_query)
 
     rate = sub.add_parser("rate", help="Rate a trace operation")
     rate.add_argument("trace_id")

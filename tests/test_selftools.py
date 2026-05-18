@@ -525,6 +525,122 @@ class TestCmdExport(TempDataMixin, unittest.TestCase):
         self.assertIn("CSV output is only supported", captured_err.getvalue())
 
 
+class TestCmdQuery(TempDataMixin, unittest.TestCase):
+    def _seed_query_data(self):
+        resource_file = Path(self._tmpdir) / "README.md"
+        resource_file.write_text("# Query Test\n", encoding="utf-8")
+        resource = selftools.normalize_resource(str(resource_file))
+        session = {
+            "session_id": "query-s1",
+            "runtime": "codex",
+            "role": "implementer",
+            "status": "active",
+            "display_name": "Query Agent",
+            "goal": "test query router",
+        }
+        selftools.write_json_atomic(selftools.session_path("query-s1"), session)
+        trace = {
+            "trace_id": "tr_query_1",
+            "session_id": "query-s1",
+            "tool": "Write",
+            "resource_path": resource,
+            "operation": "modify",
+            "intent": "query router test",
+            "pre_hash": None,
+            "post_hash": selftools.sha256_file(resource_file),
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+            "runtime": "codex",
+            "actor_type": "agent",
+            "role": "implementer",
+        }
+        selftools.append_jsonl(selftools.traces_file_for_today(), trace)
+        selftools.update_index(resource, trace, session)
+        rating = {
+            "rating_id": "rt_query_1",
+            "trace_id": "tr_query_1",
+            "rater_session_id": "query-s1",
+            "score": "good",
+            "comment": "works",
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+        }
+        selftools.append_jsonl(selftools.data_dir() / "ratings" / f"{selftools.today()}.jsonl", rating)
+        return resource_file
+
+    def test_query_json_file_default_modules(self):
+        resource_file = self._seed_query_data()
+        args = selftools.build_parser().parse_args(["q", str(resource_file), "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_query(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["schema_version"], "aids.query.v1")
+        self.assertEqual(result["target"]["kind"], "file")
+        self.assertIn("history", result["modules"])
+        modules = {item["module"]: item for item in result["results"]}
+        self.assertEqual(modules["history"]["status"], "ok")
+        self.assertEqual(modules["ratings"]["distribution"]["good"], 1)
+
+    def test_query_include_exclude_overrides_config(self):
+        resource_file = self._seed_query_data()
+        selftools.write_json_atomic(selftools.data_dir() / "config.json", {
+            "query": {"enabled_modules": ["identity", "history", "ratings"], "default_limit": 2}
+        })
+        args = selftools.build_parser().parse_args([
+            "query", str(resource_file), "--include", "file_chain,ratings", "--exclude", "ratings", "--json"
+        ])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_query(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["modules"], ["history"])
+        self.assertEqual(result["limit"], 2)
+
+    def test_query_trace_signature_and_rating(self):
+        self._seed_query_data()
+        args = selftools.build_parser().parse_args([
+            "q", "tr_query_1", "--json", "--include", "history,signature,ratings"
+        ])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_query(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["target"]["kind"], "trace")
+        modules = {item["module"]: item for item in result["results"]}
+        self.assertEqual(modules["signature"]["items"][0]["status"], "hash_present")
+        self.assertEqual(modules["ratings"]["distribution"]["good"], 1)
+
+    def test_ask_unknown_compact_output(self):
+        self._seed_query_data()
+        args = selftools.build_parser().parse_args(["ask", "query", "router", "--limit", "2"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_query(args)
+        self.assertEqual(rc, 0)
+        out = captured.getvalue()
+        self.assertIn("AIDS query", out)
+        self.assertIn("history", out)
+
+    def test_ask_detects_embedded_file_path(self):
+        resource_file = self._seed_query_data()
+        args = selftools.build_parser().parse_args(["ask", "who", "changed", str(resource_file), "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_query(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["target"]["kind"], "file")
+
+
 class TestCmdTimeline(TempDataMixin, unittest.TestCase):
     def test_timeline_empty(self):
         args = selftools.build_parser().parse_args(["timeline"])
@@ -674,7 +790,7 @@ class TestBuildParser(unittest.TestCase):
     def test_all_subcommands_registered(self):
         p = selftools.build_parser()
         # Parse each subcommand to verify it exists
-        for cmd in ["stats", "export", "timeline", "doctor", "list-sessions", "who-touched", "op-chain", "rate", "heartbeat", "whois", "session-info", "retire-session", "register-session"]:
+        for cmd in ["stats", "export", "q", "query", "ask", "timeline", "doctor", "list-sessions", "who-touched", "op-chain", "rate", "heartbeat", "whois", "session-info", "retire-session", "register-session"]:
             if cmd == "session-info":
                 args = p.parse_args([cmd, "test-id"])
             elif cmd == "retire-session":
@@ -686,6 +802,8 @@ class TestBuildParser(unittest.TestCase):
             elif cmd == "who-touched":
                 args = p.parse_args([cmd, "/tmp/test"])
             elif cmd == "op-chain":
+                args = p.parse_args([cmd, "/tmp/test"])
+            elif cmd in {"q", "query", "ask"}:
                 args = p.parse_args([cmd, "/tmp/test"])
             elif cmd == "rate":
                 args = p.parse_args([cmd, "tr_001", "good"])
