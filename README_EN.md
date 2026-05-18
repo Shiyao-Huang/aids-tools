@@ -273,6 +273,88 @@ Resources touched: 983 unique
 Ratings: 3 total (good: 3)
 ```
 
+### 🔗 Operation Chain (Hash Chain)
+
+Every trace carries a `chain_hash` — SHA256 of the previous hash + current trace's key fields. This forms a tamper-proof chain:
+
+```
+GENESIS → tr_a1b2 (chain_hash: a3f8...) → tr_a1b3 (chain_hash: 7e2c...) → ...
+```
+
+Tamper with any entry, and all subsequent hashes break.
+
+Verify with `aids verify`:
+
+```bash
+$ aids verify                   # Verify integrity of all traces
+✅ tr_a1b2c3: chain hash verified
+✅ tr_d4e5f6: chain hash verified
+✅ tr_7a8b9c: chain hash verified
+3 traces checked, 3 valid, 0 tampered.
+
+$ aids verify tr_d4e5f6         # Verify a specific trace
+✅ tr_d4e5f6: chain hash verified
+```
+
+If someone secretly modified a trace:
+
+```bash
+$ aids verify
+✅ tr_a1b2c3: chain hash verified
+❌ tr_d4e5f6: chain_hash mismatch: trace was tampered or chain broken
+✅ tr_7a8b9c: chain hash verified
+3 traces checked, 2 valid, 1 tampered.
+```
+
+**Name tags in the toy box are sealed with transparent tape — they can't be peeled off.**
+
+### 🛡️ Protected Config (Protected Keys)
+
+Some config keys are security-critical (e.g., hash chain signing strategy). Agents cannot override them:
+
+```python
+# These keys are immune to config.json overrides
+PROTECTED_CONFIG_KEYS = {
+    "signature.enabled": True,         # Signing cannot be disabled
+    "signature.strategy": "hash_chain", # Strategy cannot be changed
+    "impact.enabled": True,            # Impact analysis cannot be disabled
+}
+```
+
+**The teacher said "name tags are mandatory" — it's a class rule, not a suggestion.**
+
+### 📖 Bash Read-Operation Detection
+
+Previously only write operations were tracked. Now 20+ read commands like `cat`, `grep`, `head`, `tail`, `wc`, `sort`, `awk`, `sed`, `diff` also leave traces:
+
+```bash
+# Agent ran: cat config.json | grep database
+$ aids who-touched config.json
+AIDS (Agent-ID System) who-touched: config.json
+───────────────────────────────────────────
+│ tr_a1b2c3 read cat by Claude Impl #1 (implementer) 2min ago
+│ tr_d4e5f6 modify Edit by Codex Architect (architect) 15min ago
+```
+
+**Not just "who changed it" — now even "who read it" is tracked.**
+
+### 🌈 Colored who-touched Output
+
+Terminal `who-touched` now uses color — different roles get different colors, operation types have symbol indicators:
+
+```
+╭──────────────────────────────────────╮
+│ AIDS who-touched: config.json        │
+├──────────────────────────────────────┤
+│ tr_a1b2 ✎ Write by Claude Impl (implementer) 2min ago
+│ tr_d4e5 ✎ Edit by Codex Architect (architect) 15min ago
+│ tr_7a8b 👁 Read by bash-human (developer) 1h ago
+╰──────────────────────────────────────╯
+  3 traces  |  3 distinct agents
+```
+
+Supports `--sort time|role|op` ordering. Respects `NO_COLOR` environment variable.
+
 ### 🔍 Universal Query (q)
 
 Don't memorize commands — just ask:
@@ -287,13 +369,14 @@ $ aids q agent-7f3a9c2e1d       # Query by agent_id
 
 ## How Does It Work?
 
-AIDS is built on three core components:
+AIDS is built on four core components:
 
 1. **Hook**: Injects "check if anyone recently modified this" logic before and after every operation in Claude Code / Codex / Bash
 2. **Timeline**: All operations are written to `~/.aids/timeline/*.jsonl`, a unified operation chain
-3. **Rating**: Anyone can rate operations as good or bad, and newcomers can see those ratings (no duplicate ratings per session)
+3. **Hash Chain**: Each trace's chain_hash links to the previous one, forming a tamper-proof signature chain
+4. **Rating**: Anyone can rate operations as good or bad, and newcomers can see those ratings (no duplicate ratings per session)
 
-Full command list: `aids {doctor, who-touched, timeline, rate, stats, q, op-chain, impact, export, commit-stamp}`
+Full command list: `aids {doctor, verify, who-touched, timeline, rate, stats, q, op-chain, impact, export, commit-stamp}`
 
 Zero dependencies. JSONL files. Non-blocking. Works automatically after installation.
 

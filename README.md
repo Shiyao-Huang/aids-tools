@@ -273,6 +273,88 @@ Resources touched: 983 unique
 Ratings: 3 total (good: 3)
 ```
 
+### 🔗 操作链（Hash Chain）
+
+每条 trace 自带一个 `chain_hash`——把前一条的 hash + 本条关键字段 SHA256 签名后写入。形成一条不可篡改的操作链：
+
+```
+GENESIS → tr_a1b2 (chain_hash: a3f8...) → tr_a1b3 (chain_hash: 7e2c...) → ...
+```
+
+任何中间被篡改，后面的 hash 全部对不上。
+
+用 `aids verify` 一键验证：
+
+```bash
+$ aids verify                   # 验证所有 trace 的完整性
+✅ tr_a1b2c3: chain hash verified
+✅ tr_d4e5f6: chain hash verified
+✅ tr_7a8b9c: chain hash verified
+3 traces checked, 3 valid, 0 tampered.
+
+$ aids verify tr_d4e5f6         # 验证单条 trace
+✅ tr_d4e5f6: chain hash verified
+```
+
+如果有人偷偷改了某条 trace：
+
+```bash
+$ aids verify
+✅ tr_a1b2c3: chain hash verified
+❌ tr_d4e5f6: chain_hash mismatch: trace was tampered or chain broken
+✅ tr_7a8b9c: chain hash verified
+3 traces checked, 2 valid, 1 tampered.
+```
+
+**玩具箱里的名字贴被透明胶封死了，撕不开。**
+
+### 🛡️ 配置保护（Protected Keys）
+
+有些配置是安全关键的（比如 hash chain 签名策略），agent 不能自己关掉：
+
+```python
+# 这些 key 不受 config.json 覆盖影响
+PROTECTED_CONFIG_KEYS = {
+    "signature.enabled": True,         # 签名不能关
+    "signature.strategy": "hash_chain", # 策略不能换
+    "impact.enabled": True,            # 影响分析不能关
+}
+```
+
+**老师说"名字贴必须贴"，不是可选建议，是班规。**
+
+### 📖 Bash 读操作检测
+
+以前只追踪写操作。现在 `cat`、`grep`、`head`、`tail`、`wc`、`sort`、`awk`、`sed`、`diff` 等 20+ 读命令也会留痕：
+
+```bash
+# Agent 执行了: cat config.json | grep database
+$ aids who-touched config.json
+AIDS (Agent-ID System) who-touched: config.json
+───────────────────────────────────────────
+│ tr_a1b2c3 read cat by Claude Impl #1 (implementer) 2min ago
+│ tr_d4e5f6 modify Edit by Codex Architect (architect) 15min ago
+```
+
+**不只是"谁改了"，连"谁看了"都能追踪。**
+
+### 🌈 彩色 who-touched 输出
+
+终端里的 `who-touched` 现在有颜色了——不同角色不同色，操作类型有符号标识：
+
+```
+╭──────────────────────────────────────╮
+│ AIDS who-touched: config.json        │
+├──────────────────────────────────────┤
+│ tr_a1b2 ✎ Write by Claude Impl (implementer) 2min ago
+│ tr_d4e5 ✎ Edit by Codex Architect (architect) 15min ago
+│ tr_7a8b 👁 Read by bash-human (developer) 1h ago
+╰──────────────────────────────────────╯
+  3 traces  |  3 distinct agents
+```
+
+支持 `--sort time|role|op` 排序。尊重 `NO_COLOR` 环境变量。
+
 ### 🔍 万能查询（q）
 
 不用记命令，直接问：
@@ -287,13 +369,14 @@ $ aids q agent-7f3a9c2e1d       # 按 agent_id 查
 
 ## 怎么做到的？
 
-AIDS 的核心就是三个东西：
+AIDS 的核心就是四个东西：
 
 1. **Hook**：在 Claude Code / Codex / Bash 每次操作前后注入"看看有没有人刚动过"的逻辑
 2. **Timeline**：所有操作写入 `~/.aids/timeline/*.jsonl`，统一的操作链
-3. **Rating**：任何人可以给操作贴好评/差评，后来者能看到（同一人不能重复打分）
+3. **Hash Chain**：每条 trace 的 chain_hash 把前一条串起来，形成不可篡改的签名链
+4. **Rating**：任何人可以给操作贴好评/差评，后来者能看到（同一人不能重复打分）
 
-完整命令列表：`aids {doctor, who-touched, timeline, rate, stats, q, op-chain, impact, export, commit-stamp}`
+完整命令列表：`aids {doctor, verify, who-touched, timeline, rate, stats, q, op-chain, impact, export, commit-stamp}`
 
 零依赖。JSONL 文件。不阻塞操作。装了就生效。
 
