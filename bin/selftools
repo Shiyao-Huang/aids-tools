@@ -112,10 +112,11 @@ def data_dir() -> Path:
     return DEFAULT_DATA_DIR
 
 
-def ensure_layout() -> None:
+def ensure_layout(skip_stale_clean: bool = False) -> None:
     for rel in ["sessions", "traces", "timeline", "index", "ratings", "pending", "locks", "logs", "codegraph"]:
         (data_dir() / rel).mkdir(parents=True, exist_ok=True)
-    clean_all_stale_locks()
+    if not skip_stale_clean:
+        clean_all_stale_locks()
 
 
 def eprint(*args: Any) -> None:
@@ -631,6 +632,34 @@ def infer_actor_type(runtime: str) -> str:
     if runtime == "bash":
         return "human" if env_first("AIDS_SESSION_ID", "AID_SESSION_ID", "SESSION_ID", "SELFTOOLS_SESSION_ID", "ZHUYI_SESSION_ID") else "bash"
     return "unknown"
+
+
+def _ensure_agent_id(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Backfill agent_id for old sessions that lack it. Persists the fix."""
+    if not record.get("agent_id") and record.get("session_id"):
+        record["agent_id"] = compute_agent_id(
+            record.get("display_name", ""), record.get("role", ""), record.get("team_id")
+        )
+        write_json_atomic(session_path(record["session_id"]), record)
+    return record
+
+
+def _infer_runtime_from_record(record: Dict[str, Any]) -> str:
+    """Infer runtime from session data when the stored value is missing/unknown."""
+    rt = record.get("runtime")
+    if rt and rt != "unknown":
+        return rt
+    transcript = str(record.get("transcript_path") or "")
+    if ".codex" in transcript:
+        return "codex"
+    if ".claude" in transcript:
+        return "claude"
+    model = str(record.get("model") or "")
+    if "claude" in model.lower():
+        return "claude"
+    if "codex" in model.lower():
+        return "codex"
+    return rt or "unknown"
 
 
 def session_id_from(event: Dict[str, Any]) -> str:
@@ -1558,6 +1587,9 @@ def cmd_list_sessions(args: argparse.Namespace) -> int:
         rec = read_json(f, {})
         if rec:
             records.append(rec)
+    # Infer runtime for records with unknown/missing runtime
+    for r in records:
+        r["runtime"] = _infer_runtime_from_record(r)
     if args.status:
         records = [r for r in records if r.get("status") == args.status]
     if args.role:
@@ -1651,6 +1683,8 @@ def cmd_whois(args: argparse.Namespace) -> int:
     if not record:
         eprint_identity(f"Unknown session: {sid}")
         return 1
+    # Backfill agent_id for old sessions
+    record = _ensure_agent_id(record)
     if args.json:
         print(json_dump(record))
         return 0
@@ -1661,7 +1695,8 @@ def cmd_whois(args: argparse.Namespace) -> int:
     print(f"  Agent ID:     {record.get('agent_id', '(none)')}")
     print(f"  Role:         {record.get('role', '?')}")
     print(f"  Name:         {record.get('display_name', '(unnamed)')}")
-    print(f"  Runtime:      {record.get('runtime', '?')}{('/' + record['model']) if record.get('model') else ''}")
+    rt_display = _infer_runtime_from_record(record)
+    print(f"  Runtime:      {rt_display}{('/' + record['model']) if record.get('model') else ''}")
     print(f"  Goal:         {record.get('goal', '(none)')}")
     print(f"  Task:         {record.get('task_id', '(none)')}")
     print(f"  Team:         {record.get('team_id', '(none)')}")
@@ -2610,6 +2645,11 @@ def cmd_stats(args: argparse.Namespace) -> int:
             },
             "top_sessions": top_sessions_enriched,
         }
+        if by_agent:
+            result["by_agent"] = {
+                "sessions": sess_by_agent,
+                "traces": trace_by_agent,
+            }
         print(json_dump(result))
         return 0
 
@@ -2630,6 +2670,14 @@ def cmd_stats(args: argparse.Namespace) -> int:
     tr_runtime_parts = ", ".join(f"{k}: {v}" for k, v in sorted(trace_by_runtime.items()))
     if tr_runtime_parts:
         print(f"  By runtime: {tr_runtime_parts}")
+
+    # By-agent breakdown
+    if by_agent and sess_by_agent:
+        print()
+        print("By agent:")
+        for aid, cnt in sorted(sess_by_agent.items(), key=lambda x: -x[1]):
+            tr_cnt = trace_by_agent.get(aid, 0)
+            print(f"  {aid}: {cnt} sessions, {tr_cnt} traces")
 
     # Resources
     print(f"Resources touched: {unique_resources} unique")
@@ -3572,7 +3620,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    ensure_layout()
+    ensure_layout(skip_stale_clean=True)
     checks: List[Dict[str, Any]] = []
     # ── Core data directories ──
     for subdir in ("sessions", "traces", "timeline", "index", "ratings", "pending", "locks"):
@@ -3808,7 +3856,8 @@ def build_parser() -> argparse.ArgumentParser:
     impact.add_argument("--json", action="store_true", help="JSON output")
     impact.set_defaults(func=cmd_impact)
 
-    cs = sub.add_parser("commit-stamp", help="Output git Co-Authored-By trailer with session identity")
+    cs = sub.add_parser("commit-stamp", help="Output git commit trailer with session identity and AIDS trace summary")
+    cs.add_argument("--json", action="store_true", help="JSON output")
     cs.set_defaults(func=cmd_commit_stamp)
 
     doctor = sub.add_parser("doctor", help="Verify installation")

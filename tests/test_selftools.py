@@ -2377,5 +2377,196 @@ class TestCmdCommitStamp(TempDataMixin, unittest.TestCase):
             os.environ.pop("AIDS_RUNTIME", None)
 
 
+class TestStatsByAgent(TempDataMixin, unittest.TestCase):
+    def _seed(self):
+        dd = selftools.data_dir()
+        for i, (name, role, rt, team) in enumerate([
+            ("Bot-A", "implementer", "claude", "team-1"),
+            ("Bot-A", "implementer", "claude", "team-1"),
+            ("Bot-B", "reviewer", "codex", "team-1"),
+        ]):
+            sid = f"sa-sess-{i}"
+            record = {
+                "session_id": sid,
+                "runtime": rt,
+                "role": role,
+                "status": "active",
+                "display_name": name,
+                "team_id": team,
+                "started_at": selftools.now_ms(),
+                "started_iso": selftools.iso_now(),
+            }
+            selftools.write_json_atomic(dd / "sessions" / f"{sid}.json", record)
+        today_file = selftools.traces_file_for_today()
+        for i in range(5):
+            trace = {
+                "trace_id": f"tr_sa_{i}",
+                "session_id": f"sa-sess-{i % 3}",
+                "operation": "read" if i % 2 == 0 else "modify",
+                "resource_path": f"/tmp/f{i}.py",
+                "runtime": "claude",
+                "timestamp": selftools.now_ms(),
+                "timestamp_iso": selftools.iso_now(),
+            }
+            selftools.append_jsonl(today_file, trace)
+
+    def test_stats_by_agent_json(self):
+        self._seed()
+        args = selftools.build_parser().parse_args(["stats", "--all", "--by-agent", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_stats(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertIn("by_agent", result)
+        self.assertIn("sessions", result["by_agent"])
+        self.assertIn("traces", result["by_agent"])
+        self.assertEqual(len(result["by_agent"]["sessions"]), 2)
+
+    def test_stats_by_agent_human(self):
+        self._seed()
+        args = selftools.build_parser().parse_args(["stats", "--all", "--by-agent"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_stats(args)
+        self.assertEqual(rc, 0)
+        self.assertIn("By agent:", captured.getvalue())
+
+    def test_stats_without_by_agent_no_section(self):
+        self._seed()
+        args = selftools.build_parser().parse_args(["stats", "--all", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_stats(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertNotIn("by_agent", result)
+
+
+class TestWhoisBackfillAgentId(TempDataMixin, unittest.TestCase):
+    def test_whois_backfills_missing_agent_id(self):
+        dd = selftools.data_dir()
+        sid = "old-sess-no-aid"
+        record = {
+            "session_id": sid,
+            "display_name": "LegacyBot",
+            "role": "implementer",
+            "team_id": "team-x",
+            "runtime": "claude",
+            "status": "active",
+        }
+        selftools.write_json_atomic(dd / "sessions" / f"{sid}.json", record)
+        args = selftools.build_parser().parse_args(["whois", sid, "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_whois(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertTrue(result["agent_id"].startswith("agent-"))
+        reloaded = selftools.read_json(dd / "sessions" / f"{sid}.json", {})
+        self.assertEqual(reloaded["agent_id"], result["agent_id"])
+
+    def test_whois_preserves_existing_agent_id(self):
+        dd = selftools.data_dir()
+        sid = "new-sess-has-aid"
+        record = {
+            "session_id": sid,
+            "agent_id": "agent-original123",
+            "display_name": "NewBot",
+            "role": "implementer",
+            "runtime": "codex",
+            "status": "active",
+        }
+        selftools.write_json_atomic(dd / "sessions" / f"{sid}.json", record)
+        args = selftools.build_parser().parse_args(["whois", sid, "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_whois(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["agent_id"], "agent-original123")
+
+
+class TestListSessionsRuntimeInfer(TempDataMixin, unittest.TestCase):
+    def test_infer_runtime_from_transcript_path(self):
+        dd = selftools.data_dir()
+        record = {
+            "session_id": "rt-infer-1",
+            "runtime": "unknown",
+            "role": "implementer",
+            "status": "active",
+            "transcript_path": "/home/user/.claude/projects/abc/session.jsonl",
+        }
+        selftools.write_json_atomic(dd / "sessions" / "rt-infer-1.json", record)
+        args = selftools.build_parser().parse_args(["list-sessions", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_list_sessions(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["sessions"][0]["runtime"], "claude")
+
+    def test_infer_runtime_from_model(self):
+        dd = selftools.data_dir()
+        record = {
+            "session_id": "rt-infer-2",
+            "role": "implementer",
+            "status": "active",
+            "model": "claude-sonnet-4-6",
+        }
+        selftools.write_json_atomic(dd / "sessions" / "rt-infer-2.json", record)
+        args = selftools.build_parser().parse_args(["list-sessions", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_list_sessions(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["sessions"][0]["runtime"], "claude")
+
+    def test_infer_runtime_codex_from_transcript(self):
+        dd = selftools.data_dir()
+        record = {
+            "session_id": "rt-infer-3",
+            "runtime": "unknown",
+            "role": "implementer",
+            "status": "active",
+            "transcript_path": "/home/user/.codex/sessions/abc.jsonl",
+        }
+        selftools.write_json_atomic(dd / "sessions" / "rt-infer-3.json", record)
+        args = selftools.build_parser().parse_args(["list-sessions", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_list_sessions(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["sessions"][0]["runtime"], "codex")
+
+    def test_known_runtime_unchanged(self):
+        dd = selftools.data_dir()
+        record = {
+            "session_id": "rt-infer-4",
+            "runtime": "bash",
+            "role": "human",
+            "status": "retired",
+        }
+        selftools.write_json_atomic(dd / "sessions" / "rt-infer-4.json", record)
+        args = selftools.build_parser().parse_args(["list-sessions", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_list_sessions(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["sessions"][0]["runtime"], "bash")
+
+
 if __name__ == "__main__":
     unittest.main()
