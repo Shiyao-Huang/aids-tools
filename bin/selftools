@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import datetime as _dt
 import hashlib
+import io
 import json
 import os
 import re
@@ -25,6 +27,7 @@ import socket
 import sys
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -72,6 +75,7 @@ def data_dir() -> Path:
 def ensure_layout() -> None:
     for rel in ["sessions", "traces", "timeline", "index", "ratings", "pending", "locks", "logs"]:
         (data_dir() / rel).mkdir(parents=True, exist_ok=True)
+    clean_all_stale_locks()
 
 
 def eprint(*args: Any) -> None:
@@ -126,28 +130,130 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 
 class FileLock:
-    def __init__(self, path: Path):
+    """Cross-platform advisory file lock with timeout and stale-lock cleanup.
+
+    - POSIX (macOS/Linux): fcntl.flock with timeout via polling.
+    - Windows fallback: msvcrt.locking (non-blocking attempt + polling).
+    - Stale locks older than STALE_SECONDS are auto-removed before acquire.
+    - On timeout: issue a warning and proceed without the lock (non-blocking
+      for hooks — never wedge the CLI).
+    """
+
+    STALE_SECONDS = 300  # 5 minutes
+
+    def __init__(self, path: Path, timeout: float = 5.0):
         self.path = path
+        self.timeout = timeout
         self.fd: Optional[Any] = None
+        self._locked = False
+
+    def _clean_stale(self) -> None:
+        """Remove lock files older than STALE_SECONDS."""
+        try:
+            if self.path.exists():
+                age = time.time() - self.path.stat().st_mtime
+                if age > self.STALE_SECONDS:
+                    self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _try_acquire_posix(self) -> bool:
+        """Attempt fcntl.flock LOCK_EX | LOCK_NB. Returns True on success."""
+        try:
+            fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (OSError, IOError):
+            return False
+
+    def _try_acquire_windows(self) -> bool:
+        """Attempt msvcrt.locking acquire. Returns True on success."""
+        import msvcrt  # type: ignore
+        import os as _os
+        try:
+            self.fd.seek(0)
+            msvcrt.locking(self.fd.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except (OSError, IOError):
+            return False
 
     def __enter__(self) -> "FileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.fd = open(self.path, "a+", encoding="utf-8")
-        if fcntl is not None:
-            fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX)
-        return self
+        self._clean_stale()
+        try:
+            self.fd = open(self.path, "a+", encoding="utf-8")
+        except OSError:
+            # Cannot even open lock file — proceed without lock.
+            warnings.warn(f"AIDS: cannot open lock {self.path}", stacklevel=2)
+            return self
+
+        deadline = time.monotonic() + self.timeout
+        try_acquire = self._try_acquire_posix if fcntl is not None else self._try_acquire_windows
+
+        while True:
+            if try_acquire():
+                self._locked = True
+                return self
+            if time.monotonic() >= deadline:
+                # Timeout — warn and proceed without lock so hooks never wedge.
+                warnings.warn(
+                    f"AIDS: lock timeout ({self.timeout}s) on {self.path}, proceeding without lock",
+                    stacklevel=2,
+                )
+                try:
+                    self.fd.close()
+                except OSError:
+                    pass
+                self.fd = None
+                return self
+            time.sleep(0.05)
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self.fd is not None:
-            if fcntl is not None:
-                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
-            self.fd.close()
+        if self.fd is not None and self._locked:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+                else:
+                    import msvcrt  # type: ignore
+                    self.fd.seek(0)
+                    msvcrt.locking(self.fd.fileno(), msvcrt.LK_UNLCK, 1)
+            except (OSError, IOError):
+                pass
+            try:
+                self.fd.close()
+            except OSError:
+                pass
+        self._locked = False
+        self.fd = None
+
+
+def lock_path_for(target: Path) -> Path:
+    """Return a collision-free lock path for *target*.
+
+    Uses sha256 of the absolute path (first 16 hex chars) so that files
+    with the same name in different directories get different locks.
+    """
+    abs_str = str(target.resolve())
+    h = hashlib.sha256(abs_str.encode("utf-8")).hexdigest()[:16]
+    return data_dir() / "locks" / f"{h}.lock"
+
+
+def clean_all_stale_locks() -> None:
+    """Remove all stale lock files from the locks directory."""
+    locks_dir = data_dir() / "locks"
+    if not locks_dir.exists():
+        return
+    now = time.time()
+    for lf in locks_dir.glob("*.lock"):
+        try:
+            if now - lf.stat().st_mtime > FileLock.STALE_SECONDS:
+                lf.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = data_dir() / "locks" / (path.name + ".lock")
-    with FileLock(lock_path):
+    with FileLock(lock_path_for(path)):
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json_line(record) + "\n")
 
@@ -291,7 +397,7 @@ def load_index(resource: str) -> Dict[str, Any]:
 def update_index(resource: str, trace: Dict[str, Any], session: Dict[str, Any]) -> None:
     path = index_path(resource)
     lock_path = data_dir() / "locks" / f"index-{index_key(resource)}.lock"
-    with FileLock(lock_path):
+    with FileLock(lock_path):  # index locks already unique via base64 key
         idx = read_json(path, {}) or {}
         trace_ids = list(idx.get("trace_ids") or [])
         trace_ids.append(trace["trace_id"])
@@ -929,6 +1035,263 @@ def cmd_timeline(args: argparse.Namespace) -> int:
     return 0
 
 
+def _date_range(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
+    """Return (date_from, date_to) strings in YYYY-MM-DD, respecting --from/--to/--all."""
+    if getattr(args, "all", False):
+        return None, None
+    date_from = getattr(args, "from_date", None)
+    date_to = getattr(args, "to_date", None)
+    if not date_from and not date_to:
+        days = getattr(args, "days", 7)
+        to = _dt.date.today()
+        frm = to - _dt.timedelta(days=days - 1)
+        return frm.strftime("%Y-%m-%d"), to.strftime("%Y-%m-%d")
+    return date_from, date_to
+
+
+def _jsonl_files_in_range(directory: Path, date_from: Optional[str], date_to: Optional[str]) -> List[Path]:
+    """Return JSONL files in directory whose YYYY-MM-DD name falls within range."""
+    if not directory.exists():
+        return []
+    out: List[Path] = []
+    for f in sorted(directory.glob("*.jsonl")):
+        stem = f.stem  # e.g. 2025-05-18
+        if len(stem) == 10 and stem[4] == "-" and stem[7] == "-":
+            if date_from and stem < date_from:
+                continue
+            if date_to and stem > date_to:
+                continue
+        out.append(f)
+    return out
+
+
+def _iter_jsonl_lines(files: List[Path]) -> Iterable[Dict[str, Any]]:
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (FileNotFoundError, PermissionError):
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    ensure_layout()
+    dd = data_dir()
+    date_from, date_to = _date_range(args)
+
+    # ── Sessions ──
+    sessions_dir = dd / "sessions"
+    sessions: List[Dict[str, Any]] = []
+    if sessions_dir.exists():
+        for f in sessions_dir.glob("*.json"):
+            rec = read_json(f, {})
+            if rec:
+                sessions.append(rec)
+
+    # Filter sessions by date if needed
+    if date_from or date_to:
+        filtered = []
+        for s in sessions:
+            started = s.get("started_iso") or ""
+            started_date = started[:10]  # YYYY-MM-DD
+            if date_from and started_date and started_date < date_from:
+                continue
+            if date_to and started_date and started_date > date_to:
+                continue
+            filtered.append(s)
+        sessions = filtered
+
+    sess_total = len(sessions)
+    sess_by_status: Dict[str, int] = {}
+    sess_by_runtime: Dict[str, int] = {}
+    sess_by_role: Dict[str, int] = {}
+    for s in sessions:
+        st = s.get("status") or "unknown"
+        rt = s.get("runtime") or "unknown"
+        rl = s.get("role") or "unknown"
+        sess_by_status[st] = sess_by_status.get(st, 0) + 1
+        sess_by_runtime[rt] = sess_by_runtime.get(rt, 0) + 1
+        sess_by_role[rl] = sess_by_role.get(rl, 0) + 1
+
+    # ── Traces ──
+    trace_files = _jsonl_files_in_range(dd / "traces", date_from, date_to)
+    trace_count = 0
+    op_counts: Dict[str, int] = {}
+    trace_by_session: Dict[str, int] = {}
+    trace_by_runtime: Dict[str, int] = {}
+    resource_counts: Dict[str, int] = {}
+    for tr in _iter_jsonl_lines(trace_files):
+        trace_count += 1
+        op = tr.get("operation") or "unknown"
+        op_counts[op] = op_counts.get(op, 0) + 1
+        sid = tr.get("session_id") or "unknown"
+        trace_by_session[sid] = trace_by_session.get(sid, 0) + 1
+        rt = tr.get("runtime") or "unknown"
+        trace_by_runtime[rt] = trace_by_runtime.get(rt, 0) + 1
+        res = tr.get("resource_path") or "unknown"
+        resource_counts[res] = resource_counts.get(res, 0) + 1
+
+    # ── Timeline ──
+    tl_files = _jsonl_files_in_range(dd / "timeline", date_from, date_to)
+    timeline_count = sum(1 for _ in _iter_jsonl_lines(tl_files))
+
+    # ── Ratings ──
+    rating_files = _jsonl_files_in_range(dd / "ratings", date_from, date_to)
+    rating_count = 0
+    rating_dist: Dict[str, int] = {}
+    for r in _iter_jsonl_lines(rating_files):
+        rating_count += 1
+        sc = r.get("score") or "unknown"
+        rating_dist[sc] = rating_dist.get(sc, 0) + 1
+
+    # ── Resources ──
+    unique_resources = len(resource_counts)
+    top_resources = sorted(resource_counts.items(), key=lambda x: -x[1])[:5]
+
+    # ── Top 5 most active sessions ──
+    top_sessions = sorted(trace_by_session.items(), key=lambda x: -x[1])[:5]
+    # Enrich with session metadata
+    top_sessions_enriched = []
+    for sid, count in top_sessions:
+        meta = load_session(sid)
+        top_sessions_enriched.append({
+            "session_id": sid,
+            "ops": count,
+            "role": (meta.get("role") or "unknown"),
+            "runtime": (meta.get("runtime") or "unknown"),
+            "display_name": (meta.get("display_name") or sid),
+        })
+
+    # ── Output ──
+    if getattr(args, "json", False):
+        result = {
+            "date_range": {"from": date_from, "to": date_to},
+            "sessions": {
+                "total": sess_total,
+                "by_status": sess_by_status,
+                "by_runtime": sess_by_runtime,
+                "by_role": sess_by_role,
+            },
+            "traces": {
+                "total": trace_count,
+                "by_operation": op_counts,
+                "by_runtime": trace_by_runtime,
+            },
+            "resources": {
+                "unique": unique_resources,
+                "top": [{"path": p, "ops": c} for p, c in top_resources],
+            },
+            "timeline_events": timeline_count,
+            "ratings": {
+                "total": rating_count,
+                "distribution": rating_dist,
+            },
+            "top_sessions": top_sessions_enriched,
+        }
+        print(json_dump(result))
+        return 0
+
+    # Human-readable
+    range_label = f"{date_from or 'beginning'} → {date_to or 'now'}"
+    print(f"AIDS Statistics ({range_label})")
+    print()
+
+    # Sessions
+    status_parts = ", ".join(f"{k}: {v}" for k, v in sorted(sess_by_status.items()))
+    runtime_parts = ", ".join(f"{k}: {v}" for k, v in sorted(sess_by_runtime.items()))
+    print(f"Sessions: {sess_total} total ({status_parts})")
+    print(f"  By runtime: {runtime_parts}")
+
+    # Traces
+    op_parts = ", ".join(f"{k}: {v}" for k, v in sorted(op_counts.items()))
+    print(f"Traces:   {trace_count} total ({op_parts})")
+    tr_runtime_parts = ", ".join(f"{k}: {v}" for k, v in sorted(trace_by_runtime.items()))
+    if tr_runtime_parts:
+        print(f"  By runtime: {tr_runtime_parts}")
+
+    # Resources
+    print(f"Resources touched: {unique_resources} unique")
+    if top_resources:
+        print("  Top resources:")
+        for p, c in top_resources:
+            display = p
+            try:
+                display = os.path.relpath(p)
+            except Exception:
+                pass
+            display = short(display, 60)
+            print(f"    {display} ({c} ops)")
+
+    # Ratings
+    rating_parts = ", ".join(f"{k}: {v}" for k, v in sorted(rating_dist.items()))
+    print(f"Ratings: {rating_count} total ({rating_parts})")
+
+    # Timeline
+    print(f"Timeline events: {timeline_count}")
+
+    # Top sessions
+    if top_sessions_enriched:
+        print()
+        print("Most active sessions (top 5):")
+        for i, s in enumerate(top_sessions_enriched, 1):
+            print(f"  {i}. {s['display_name']} ({s['role']}, {s['runtime']}) — {s['ops']} ops")
+
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export trace records in JSONL, JSON, or CSV format."""
+    ensure_layout()
+    dd = data_dir()
+    date_from, date_to = _date_range(args)
+
+    trace_files = _jsonl_files_in_range(dd / "traces", date_from, date_to)
+    fmt = getattr(args, "format", "jsonl") or "jsonl"
+    session_filter = getattr(args, "session", None)
+    resource_filter = getattr(args, "resource", None)
+
+    if resource_filter:
+        resource_filter = normalize_resource(resource_filter)
+
+    traces: List[Dict[str, Any]] = []
+    for tr in _iter_jsonl_lines(trace_files):
+        if session_filter and tr.get("session_id") != session_filter:
+            continue
+        if resource_filter and tr.get("resource_path") != resource_filter:
+            continue
+        traces.append(tr)
+
+    output_path = getattr(args, "output", None)
+    out = open(output_path, "w", encoding="utf-8") if output_path else sys.stdout
+    try:
+        if fmt == "jsonl":
+            for tr in traces:
+                out.write(json_line(tr) + "\n")
+        elif fmt == "json":
+            out.write(json.dumps(traces, ensure_ascii=False, indent=2) + "\n")
+        elif fmt == "csv":
+            columns = ["trace_id", "timestamp_iso", "session_id", "tool", "resource_path", "operation", "intent", "runtime", "role"]
+            writer = csv.writer(out)
+            writer.writerow(columns)
+            for tr in traces:
+                writer.writerow([tr.get(c, "") for c in columns])
+    finally:
+        if output_path:
+            out.close()
+
+    count = len(traces)
+    if not output_path:
+        eprint(f"Exported {count} trace(s) as {fmt}")
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     ensure_layout()
     checks = []
@@ -1036,6 +1399,14 @@ def build_parser() -> argparse.ArgumentParser:
     tl.add_argument("--limit", type=int, default=20)
     tl.add_argument("--json", action="store_true")
     tl.set_defaults(func=cmd_timeline)
+
+    stats = sub.add_parser("stats", help="Show aggregated statistics")
+    stats.add_argument("--json", action="store_true", help="JSON output")
+    stats.add_argument("--days", type=int, default=7, help="Lookback window in days (default: 7)")
+    stats.add_argument("--all", action="store_true", dest="all", help="All time, ignore --days")
+    stats.add_argument("--from", dest="from_date", help="Start date YYYY-MM-DD")
+    stats.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD")
+    stats.set_defaults(func=cmd_stats)
 
     doctor = sub.add_parser("doctor", help="Verify installation")
     doctor.add_argument("--json", action="store_true")

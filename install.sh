@@ -216,9 +216,27 @@ install_payload() {
   run chmod +x "$INSTALL_DIR/bin/selftools" "$INSTALL_DIR/bin/selftools-mcp" "$INSTALL_DIR"/hooks/*.sh "$INSTALL_DIR"/wrappers/*
 }
 
+ensure_gitnexus() {
+  if [ "${WITH_GITNEXUS:-}" = "1" ]; then
+    if command -v gitnexus >/dev/null 2>&1 || command -v npx >/dev/null 2>&1; then
+      info "GitNexus integration: enabled"
+    else
+      warn "GitNexus requested but neither gitnexus nor npx found; integration will be inactive"
+    fi
+  elif [ "${WITH_GITNEXUS:-}" = "0" ]; then
+    info "GitNexus integration: disabled by flag"
+  else
+    if command -v gitnexus >/dev/null 2>&1; then
+      info "GitNexus integration: auto-detected gitnexus binary"
+    else
+      info "GitNexus integration: not detected (use --with-gitnexus to enable)"
+    fi
+  fi
+}
+
 install_bins() {
   ensure_gitnexus
-info "Installing CLI shims into $BIN_DIR"
+  info "Installing CLI shims into $BIN_DIR"
   run mkdir -p "$BIN_DIR"
   run ln -sf "$INSTALL_DIR/bin/selftools" "$BIN_DIR/selftools"
   run ln -sf "$INSTALL_DIR/bin/selftools" "$BIN_DIR/aids"
