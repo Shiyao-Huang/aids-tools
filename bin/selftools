@@ -319,13 +319,17 @@ class FileLock:
             self.fd.write(json_line({"pid": os.getpid(), "ts": now_ms()}) + "\n")
             self.fd.flush()
 
-    def _break_stale_lock(self) -> bool:
+    def _break_stale_lock(self, *, check_ttl: bool = True) -> bool:
         """Remove lock file if the holder process is dead OR the lock has expired.
 
         A lock is considered stale when:
         1. The lock file is absent / unreadable, OR
         2. The holder PID is dead, OR
-        3. The lock is older than *self.ttl* seconds (TTL expiry).
+        3. (when *check_ttl* is True) The lock is older than *self.ttl* seconds.
+
+        Args:
+            check_ttl: When False, skip TTL-based expiry and only break locks
+                whose holder PID is dead.  Defaults to True.
 
         Returns True if the lock was stale (or absent), False if holder is alive
         and lock is within TTL.
@@ -337,15 +341,16 @@ class FileLock:
         if not isinstance(pid, int) or pid <= 0:
             return True
         # TTL-based expiry: break locks older than ttl seconds
-        ts = info.get("ts")
-        if isinstance(ts, (int, float)) and ts > 0:
-            age_ms = now_ms() - ts
-            if age_ms > self.ttl * 1000:
-                try:
-                    self.path.unlink()
-                except FileNotFoundError:
-                    pass
-                return True
+        if check_ttl:
+            ts = info.get("ts")
+            if isinstance(ts, (int, float)) and ts > 0:
+                age_ms = now_ms() - ts
+                if age_ms > self.ttl * 1000:
+                    try:
+                        self.path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    return True
         if not self._is_pid_alive(pid):
             try:
                 self.path.unlink()
@@ -431,12 +436,12 @@ class FileLock:
         deadline = time.monotonic() + timeout
 
         while True:
-            self._break_stale_lock()
+            self._break_stale_lock(check_ttl=False)
             if self._try_acquire_nb():
                 return self
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                if self._break_stale_lock() and self._try_acquire_nb():
+                if self._break_stale_lock(check_ttl=False) and self._try_acquire_nb():
                     return self
                 raise TimeoutError(
                     f"Lock {self.path} not acquired within {timeout}s"
@@ -451,14 +456,14 @@ class FileLock:
 
         deadline = time.monotonic() + self.timeout
         while True:
-            self._break_stale_lock()
+            self._break_stale_lock(check_ttl=False)
             self._clean_stale_mtime()
             if self._try_acquire_nb():
                 return self
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 # One last attempt after stale-break
-                if self._break_stale_lock() and self._try_acquire_nb():
+                if self._break_stale_lock(check_ttl=False) and self._try_acquire_nb():
                     return self
                 raise TimeoutError(
                     f"Lock {self.path} not acquired within {self.timeout}s"
@@ -805,6 +810,61 @@ def update_index(resource: str, trace: Dict[str, Any], session: Dict[str, Any]) 
                 }
             )
         write_json_atomic(path, idx)
+
+
+def _append_trace_chain_atomic(
+    resource: str, trace: Dict[str, Any], session: Dict[str, Any]
+) -> None:
+    """Atomically compute chain hash, append trace, and update resource index.
+
+    Performs all three steps under a single resource-index lock so that
+    concurrent writers never read the same ``last_chain_hash`` and produce
+    a broken chain.
+    """
+    idx_path = index_path(resource)
+    idx_lock = lock_path_for(idx_path)
+    with FileLock(idx_lock):
+        # 1. read previous chain hash from index
+        idx = read_json(idx_path, {}) or {}
+        prev_chain_hash = idx.get("last_chain_hash")
+
+        # 2. compute new chain hash
+        trace["chain_hash"] = _chain_hash_for_trace(trace, prev_chain_hash)
+
+        # 3. append trace to JSONL
+        append_jsonl(traces_file_for_today(), trace)
+
+        # 4. update resource index (inline, still under same lock)
+        trace_ids = list(idx.get("trace_ids") or [])
+        trace_ids.append(trace["trace_id"])
+        trace_ids = trace_ids[-500:]
+        idx.update(
+            {
+                "resource_path": resource,
+                "trace_ids": trace_ids,
+                "last_op": trace.get("operation"),
+                "last_actor": trace.get("session_id"),
+                "last_agent_id": trace.get("agent_id") or session.get("agent_id"),
+                "last_actor_role": session.get("role"),
+                "last_actor_type": trace.get("actor_type") or session.get("actor_type"),
+                "last_runtime": trace.get("runtime") or session.get("runtime"),
+                "last_intent": trace.get("intent"),
+                "last_seen_at": trace.get("timestamp"),
+                "last_chain_hash": trace["chain_hash"],
+                "timeline_path": str(data_dir() / "timeline" / f"{today()}.jsonl"),
+                "total_ops": int(idx.get("total_ops") or 0) + 1,
+            }
+        )
+        if trace.get("operation") in {"create", "modify", "delete"}:
+            idx.update(
+                {
+                    "last_writer": trace.get("session_id"),
+                    "last_writer_role": session.get("role"),
+                    "last_write_intent": trace.get("intent"),
+                    "last_write_at": trace.get("timestamp"),
+                }
+            )
+        write_json_atomic(idx_path, idx)
 
 
 def traces_file_for_today() -> Path:
@@ -1394,13 +1454,9 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
             },
         }
         trace["timeline_path"] = str(timeline_file_for_today())
-        # ── Chain hash: link to previous trace on this resource ──
-        prev_idx = load_index(res)
-        prev_chain_hash = prev_idx.get("last_chain_hash")
-        trace["chain_hash"] = _chain_hash_for_trace(trace, prev_chain_hash)
-        append_jsonl(traces_file_for_today(), trace)
+        # ── Chain hash + append + index update: atomic under resource lock ──
+        _append_trace_chain_atomic(res, trace, session)
         timeline_events.append(timeline_event_from_trace(trace, event, session))
-        update_index(res, trace, session)
         trace_ids.append(trace["trace_id"])
     # Batch-write all timeline events under a single lock to reduce contention.
     append_jsonl_multi(timeline_file_for_today(), timeline_events)

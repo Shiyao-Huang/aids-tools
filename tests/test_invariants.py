@@ -721,5 +721,85 @@ class TestSignatureBackendAndVerify(AIDSTestBase):
         self.assertIn("chain_hash mismatch", result.stdout)
 
 
+# ============================================================
+# Atomic chain-hash concurrent write test
+# ============================================================
+class TestAtomicChainHash(AIDSTestBase):
+    """Verify _append_trace_chain_atomic produces a valid chain under concurrency."""
+
+    def _verify_chain(self, traces: List[Dict[str, Any]]) -> None:
+        """Re-verify every chain_hash in the ordered trace list."""
+        prev_hash: Optional[str] = None
+        for tr in traces:
+            stored = tr.get("chain_hash")
+            self.assertIsNotNone(stored, f"trace {tr.get('trace_id')} missing chain_hash")
+            expected = hashlib.sha256(
+                (
+                    f"{prev_hash or 'GENESIS'}:"
+                    + json.dumps(
+                        {
+                            "trace_id": tr.get("trace_id"),
+                            "session_id": tr.get("session_id"),
+                            "tool": tr.get("tool"),
+                            "resource_path": tr.get("resource_path"),
+                            "operation": tr.get("operation"),
+                            "pre_hash": tr.get("pre_hash"),
+                            "post_hash": tr.get("post_hash"),
+                            "timestamp": tr.get("timestamp"),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(
+                stored,
+                expected,
+                f"chain_hash mismatch at trace {tr.get('trace_id')}: "
+                f"stored={stored}, expected={expected}",
+            )
+            prev_hash = stored
+
+    def test_chain_atomic_concurrent(self) -> None:
+        """10 threads write to the same resource concurrently; all chain hashes must verify."""
+        import threading
+
+        self._simulate_session_start()
+
+        num_threads = 10
+        barrier = threading.Barrier(num_threads)
+        errors: List[str] = []
+
+        def worker(idx: int) -> None:
+            try:
+                barrier.wait(timeout=10)
+                self._simulate_write_flow(str(self.test_file), f"# thread-{idx}\n")
+            except Exception as exc:
+                errors.append(f"thread-{idx}: {exc}")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(errors, [], f"Worker errors: {errors}")
+
+        traces = self._traces_today()
+        # Use JSONL natural order (= lock acquisition order = chain order).
+        # Do NOT sort by timestamp — concurrent writes may have identical timestamps
+        # but the chain order is determined by who acquired the index lock first.
+        write_traces = [
+            t for t in traces
+            if t.get("operation") in ("modify", "create")
+            and t.get("resource_path") == str(self.test_file)
+        ]
+        self.assertGreaterEqual(len(write_traces), num_threads,
+                                f"Expected >= {num_threads} write traces, got {len(write_traces)}")
+
+        self._verify_chain(write_traces)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
