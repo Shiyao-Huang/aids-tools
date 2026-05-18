@@ -926,7 +926,7 @@ _BASH_READ_COMMANDS = frozenset({
 
 # Flags that consume the next token as a value (not a file argument).
 _BASH_READ_VALUE_FLAGS = frozenset({
-    "-e", "--regexp", "-f", "--file", "--color", "--colour",
+    "-e", "--regexp", "--file", "--color", "--colour",
     "--exclude", "--include", "--exclude-dir",
     "-n", "--lines", "-c", "--bytes",
     "-k", "--key", "-t", "--field-separator", "-o", "--output",
@@ -1365,6 +1365,25 @@ _OPERATION_COLORS = {
     "touch": _dim,
 }
 
+# Visual operation symbols for quick scanning
+_OPERATION_SYMBOLS = {
+    "create": "+",
+    "modify": "~",
+    "delete": "x",
+    "read": ">",
+    "execute": "!",
+    "touch": ".",
+}
+
+
+def _role_color(role: str) -> str:
+    """Pick a stable color for a role name."""
+    if not role or role == "unknown":
+        return _dim(role)
+    palette = [_cyan, _green, _yellow, _magenta, _red]
+    idx = hash(role) % len(palette)
+    return palette[idx](role)
+
 
 def print_traces_for_resource(resource_arg: str, limit: int, *, as_json: bool = False,
                               sort_by: str = "time", reverse: bool = False) -> int:
@@ -1383,31 +1402,54 @@ def print_traces_for_resource(resource_arg: str, limit: int, *, as_json: bool = 
     elif sort_by == "agent":
         traces.sort(key=lambda t: (t.get("session", {}).get("display_name") or t.get("session_id") or "",
                                    t.get("timestamp") or 0))
-    else:  # time (default, newest last → already chronological from index)
+    else:  # time (default, newest last -> already chronological from index)
         pass
     if reverse:
         traces.reverse()
-    print(f"{_bold(ZH_NAME)} traces for {_bold(disp)}:")
+    # Header with box drawing
+    hdr = f" {ZH_NAME} who-touched: {disp} "
+    bar_w = max(len(hdr), 40)
+    bar = "\u2500" * bar_w
+    print(f"\n\u250c{bar}\u2510")
+    print(f"\u2502{_bold(hdr):<{bar_w}}\u2502")
+    print(f"\u251c{bar}\u2524")
     # Aggregate by agent_id to show cross-session identity grouping
     agent_ids_seen: Dict[str, int] = {}
+    op_counts: Dict[str, int] = {}
     for tr in traces:
         sess = tr.get("session") or {}
         aid = tr.get("agent_id") or sess.get("agent_id") or ""
         if aid:
             agent_ids_seen[aid] = agent_ids_seen.get(aid, 0) + 1
         actor = sess.get("display_name") or tr.get("session_id")
-        # Show agent_id when available for cross-session identity
-        aid_display = f" [{aid[:12]}…]" if aid else ""
+        aid_display = f" [{aid[:12]}...]" if aid else ""
         op = tr.get("operation") or "touch"
-        op_colored = _OPERATION_COLORS.get(op, str)(op)
+        op_counts[op] = op_counts.get(op, 0) + 1
+        sym = _OPERATION_SYMBOLS.get(op, " ")
+        op_colored = _OPERATION_COLORS.get(op, str)(f"{sym} {op}")
+        role_str = _role_color(sess.get("role") or "unknown")
+        tool_str = _bold(tr.get("tool") or "?")
+        ago = human_ago(int(tr.get("timestamp") or now_ms()))
+        intent_str = short(tr.get("intent") or "", 140)
         print(
-            f"  {_dim(tr.get('trace_id'))} {op_colored} {_bold(tr.get('tool'))} "
+            f"\u2502 {_dim(tr.get('trace_id'))} {op_colored} {tool_str} "
             f"by {_cyan(str(actor))}"
-            f"{aid_display} ({_dim(sess.get('role', 'unknown'))}) "
-            f"{human_ago(int(tr.get('timestamp') or now_ms()))}; intent: {short(tr.get('intent'), 140)}"
+            f"{aid_display} ({role_str}) "
+            f"{ago}; intent: {intent_str}"
         )
+    # Footer with summary
+    print(f"\u2514{bar}\u2518")
+    # Colored operation summary
+    parts = []
+    for op_name, count in sorted(op_counts.items(), key=lambda x: -x[1]):
+        sym = _OPERATION_SYMBOLS.get(op_name, " ")
+        col_fn = _OPERATION_COLORS.get(op_name, str)
+        parts.append(col_fn(f"{sym}{op_name}:{count}"))
+    summary = "  ".join(parts)
+    agents_note = ""
     if len(agent_ids_seen) > 1:
-        print(f"  ({len(agent_ids_seen)} distinct agents touched this file)")
+        agents_note = f"  |  {_yellow(str(len(agent_ids_seen)))} distinct agents"
+    print(f" {summary}{agents_note}")
     return 0
 
 
