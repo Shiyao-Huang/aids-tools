@@ -1286,7 +1286,7 @@ def _record_matches_filters(
         if kind not in {"traces", "timeline"}:
             return False
         resource_value = record.get("resource_path") or record.get("resource")
-        if resource_value != resource_filter:
+        if resource_value != resource_filter and _normalize_export_resource(str(resource_value or "")) != resource_filter:
             return False
     return True
 

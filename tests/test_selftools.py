@@ -7,6 +7,7 @@ Run: python -m pytest tests/test_selftools.py -v
 from __future__ import annotations
 
 import datetime as _dt
+import csv
 import json
 import os
 import shutil
@@ -175,6 +176,7 @@ class TestToolIntent(unittest.TestCase):
     def test_no_input(self):
         result = selftools.tool_intent({})
         self.assertEqual(result, "unspecified")
+
 
 
 # ─── Session management ───
@@ -415,6 +417,114 @@ class TestCmdStats(TempDataMixin, unittest.TestCase):
         self.assertEqual(result["traces"]["total"], 0)
 
 
+class TestCmdExport(TempDataMixin, unittest.TestCase):
+    def _seed_export_data(self):
+        dd = selftools.data_dir()
+        session = {
+            "session_id": "export-s1",
+            "runtime": "codex",
+            "role": "implementer",
+            "status": "active",
+            "display_name": "Export Agent",
+            "started_iso": selftools.iso_now(),
+            "last_seen_iso": selftools.iso_now(),
+        }
+        selftools.write_json_atomic(dd / "sessions" / "export-s1.json", session)
+
+        trace = {
+            "trace_id": "tr_export_1",
+            "session_id": "export-s1",
+            "tool": "Write",
+            "resource_path": "/tmp/export.py",
+            "operation": "modify",
+            "intent": "export test",
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+            "runtime": "codex",
+            "actor_type": "agent",
+            "role": "implementer",
+        }
+        selftools.append_jsonl(selftools.traces_file_for_today(), trace)
+
+        timeline = {
+            "event_id": "ev_export_1",
+            "trace_id": "tr_export_1",
+            "session_id": "export-s1",
+            "resource": "/tmp/export.py",
+            "tool": "Write",
+            "operation": "modify",
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+        }
+        selftools.append_jsonl(selftools.timeline_file_for_today(), timeline)
+
+        rating = {
+            "rating_id": "rt_export_1",
+            "trace_id": "tr_export_1",
+            "rater_session_id": "export-s1",
+            "score": "good",
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+        }
+        selftools.append_jsonl(dd / "ratings" / f"{selftools.today()}.jsonl", rating)
+
+    def test_export_default_json_all_with_metadata(self):
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["metadata"]["format"], "json")
+        self.assertEqual(result["metadata"]["type"], "all")
+        self.assertEqual(result["metadata"]["record_count"], 4)
+        self.assertIn("exported_at", result["metadata"])
+        self.assertEqual(len(result["data"]["traces"]), 1)
+        self.assertEqual(len(result["data"]["sessions"]), 1)
+
+    def test_export_jsonl_trace_filter(self):
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args([
+            "export", "--format", "jsonl", "--type", "traces",
+            "--session", "export-s1", "--resource", "/tmp/export.py",
+        ])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        lines = [json.loads(line) for line in captured.getvalue().strip().splitlines()]
+        self.assertIn("metadata", lines[0])
+        self.assertEqual(lines[0]["metadata"]["record_count"], 1)
+        self.assertEqual(lines[1]["trace_id"], "tr_export_1")
+
+    def test_export_csv_traces_includes_metadata_columns(self):
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--format", "csv", "--type", "traces"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 0)
+        rows = list(csv.reader(io.StringIO(captured.getvalue())))
+        self.assertIn("exported_at", rows[0])
+        self.assertIn("trace_id", rows[0])
+        self.assertEqual(rows[1][rows[0].index("record_count")], "1")
+        self.assertEqual(rows[1][rows[0].index("trace_id")], "tr_export_1")
+
+    def test_export_csv_rejects_sessions(self):
+        self._seed_export_data()
+        args = selftools.build_parser().parse_args(["export", "--format", "csv", "--type", "sessions"])
+        import io
+        captured_err = io.StringIO()
+        with patch("sys.stderr", captured_err):
+            rc = selftools.cmd_export(args)
+        self.assertEqual(rc, 2)
+        self.assertIn("CSV output is only supported", captured_err.getvalue())
+
+
 class TestCmdTimeline(TempDataMixin, unittest.TestCase):
     def test_timeline_empty(self):
         args = selftools.build_parser().parse_args(["timeline"])
@@ -564,7 +674,7 @@ class TestBuildParser(unittest.TestCase):
     def test_all_subcommands_registered(self):
         p = selftools.build_parser()
         # Parse each subcommand to verify it exists
-        for cmd in ["stats", "timeline", "doctor", "list-sessions", "who-touched", "op-chain", "rate", "heartbeat", "whois", "session-info", "retire-session", "register-session"]:
+        for cmd in ["stats", "export", "timeline", "doctor", "list-sessions", "who-touched", "op-chain", "rate", "heartbeat", "whois", "session-info", "retire-session", "register-session"]:
             if cmd == "session-info":
                 args = p.parse_args([cmd, "test-id"])
             elif cmd == "retire-session":
@@ -594,6 +704,16 @@ class TestBuildParser(unittest.TestCase):
         p = selftools.build_parser().parse_args(["stats", "--from", "2026-01-01", "--to", "2026-01-31"])
         self.assertEqual(getattr(p, "from_date"), "2026-01-01")
         self.assertEqual(getattr(p, "to_date"), "2026-01-31")
+
+    def test_export_defaults_and_flags(self):
+        p = selftools.build_parser()
+        args = p.parse_args(["export"])
+        self.assertEqual(args.format, "json")
+        self.assertEqual(args.type, "all")
+        args = p.parse_args(["export", "--format", "csv", "--type", "timeline", "--days", "3"])
+        self.assertEqual(args.format, "csv")
+        self.assertEqual(args.type, "timeline")
+        self.assertEqual(args.days, 3)
 
 
 if __name__ == "__main__":
