@@ -16,6 +16,10 @@
  *   AIDS_SESSION_ID, AIDS_ROLE, AIDS_INTENT, AIDS_RUNTIME, AIDS_ACTOR_TYPE
  */
 
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const { resolve } = require('../lib/session');
 const { getRecentTraces, normalizeFilePath, TRACE_OPERATIONS } = require('../src/trace/trace');
 
@@ -44,6 +48,7 @@ function handle(input) {
   const identity = resolve();
   const runtime = inferRuntime();
   const actorType = inferActorType(runtime);
+  const agentId = resolveAgentId(identity);
 
   if (!TRACE_OPERATIONS.has(toolName)) {
     process.exit(0);
@@ -69,7 +74,7 @@ function handle(input) {
 
   // Bash: lightweight command context
   if (toolName === 'Bash') {
-    injectBashContext(identity, toolInput.command || '', runtime, actorType);
+    injectBashContext(identity, toolInput.command || '', runtime, actorType, agentId);
   }
 
   process.exit(0);
@@ -92,6 +97,30 @@ function inferActorType(runtime) {
   if (runtime === 'claude' || runtime === 'codex') return 'agent';
   if (runtime === 'bash') return process.env.AIDS_SESSION_ID ? 'human' : 'bash';
   return 'unknown';
+}
+
+/**
+ * Resolve agent_id: env var → session file → compute from identity fields.
+ */
+function resolveAgentId(identity) {
+  const fromEnv = process.env.AIDS_AGENT_ID ||
+                  process.env.AID_AGENT_ID ||
+                  process.env.SELFTOOLS_AGENT_ID ||
+                  process.env.ZHUYI_AGENT_ID;
+  if (fromEnv) return fromEnv;
+
+  if (identity.session_id && identity.session_id !== 'unknown') {
+    try {
+      const sessionPath = path.join(os.homedir(), '.aids', 'sessions', `${identity.session_id}.json`);
+      if (fs.existsSync(sessionPath)) {
+        const record = JSON.parse(fs.readFileSync(sessionPath, 'utf-8'));
+        if (record.agent_id) return record.agent_id;
+      }
+    } catch { /* fall through */ }
+  }
+
+  const input = `${identity.display_name || ''}:${identity.role || ''}:${identity.team_id || ''}`;
+  return 'agent-' + crypto.createHash('sha256').update(input).digest('hex').slice(0, 16);
 }
 
 /**
@@ -217,11 +246,11 @@ function injectWriteContext(identity, resourceKey, runtime, actorType) {
   process.stderr.write(budgetLines(lines).join('\n'));
 }
 
-function injectBashContext(identity, command, runtime, actorType) {
+function injectBashContext(identity, command, runtime, actorType, agentId) {
   if (!command) return;
   const short = command.length > 60 ? command.slice(0, 57) + '...' : command;
   process.stderr.write(
-    `AIDS pre-bash | ${runtime}/${actorType} | ${identity.role}/${identity.session_id.slice(0, 8)} | ${short}\n`
+    `AIDS pre-bash | ${runtime}/${actorType} | ${identity.role}/${identity.session_id.slice(0, 8)} | agent_id=${agentId} | ${short}\n`
   );
 }
 

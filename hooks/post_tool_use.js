@@ -17,7 +17,10 @@
  */
 
 const crypto = require('crypto');
-const { resolve } = require('../lib/session');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { resolve, lookup } = require('../lib/session');
 const { appendTrace, normalizeFilePath, TRACE_OPERATIONS } = require('../src/trace/trace');
 
 let inputData = '';
@@ -43,6 +46,7 @@ function handle(input) {
   const identity = resolve();
   const runtime = inferRuntime();
   const actorType = inferActorType(runtime);
+  const agentId = resolveAgentId(identity);
 
   // Extract resource keys (may be multiple for Bash with file mutations)
   const resourceKeys = extractResourceKeys(toolName, toolInput);
@@ -56,6 +60,7 @@ function handle(input) {
       appendTrace({
         sessionId: identity.session_id,
         role: identity.role,
+        agent_id: agentId,
         agentName: identity.display_name || identity.role,
         runtime,
         actor_type: actorType,
@@ -73,7 +78,7 @@ function handle(input) {
   // Surface trace info to agent
   const mainKey = resourceKeys[0];
   process.stderr.write(
-    `AIDS trace: ${toolName} ${mainKey} | ${actorType}/${runtime} ${identity.role}/${identity.session_id.slice(0, 8)}\n`
+    `AIDS trace: ${toolName} ${mainKey} | ${actorType}/${runtime} ${identity.role}/${identity.session_id.slice(0, 8)} | agent_id=${agentId}\n`
   );
 
   process.exit(0);
@@ -96,6 +101,33 @@ function inferActorType(runtime) {
   if (runtime === 'claude' || runtime === 'codex') return 'agent';
   if (runtime === 'bash') return process.env.AIDS_SESSION_ID ? 'human' : 'bash';
   return 'unknown';
+}
+
+/**
+ * Resolve agent_id: env var → session file → compute from identity fields.
+ */
+function resolveAgentId(identity) {
+  // 1. Explicit env var (set by shell wrapper or parent process)
+  const fromEnv = process.env.AIDS_AGENT_ID ||
+                  process.env.AID_AGENT_ID ||
+                  process.env.SELFTOOLS_AGENT_ID ||
+                  process.env.ZHUYI_AGENT_ID;
+  if (fromEnv) return fromEnv;
+
+  // 2. Read from session file
+  if (identity.session_id && identity.session_id !== 'unknown') {
+    try {
+      const sessionPath = path.join(os.homedir(), '.aids', 'sessions', `${identity.session_id}.json`);
+      if (fs.existsSync(sessionPath)) {
+        const record = JSON.parse(fs.readFileSync(sessionPath, 'utf-8'));
+        if (record.agent_id) return record.agent_id;
+      }
+    } catch { /* fall through */ }
+  }
+
+  // 3. Compute deterministic agent_id from identity fields
+  const input = `${identity.display_name || ''}:${identity.role || ''}:${identity.team_id || ''}`;
+  return 'agent-' + crypto.createHash('sha256').update(input).digest('hex').slice(0, 16);
 }
 
 /**
