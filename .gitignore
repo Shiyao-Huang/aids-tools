@@ -4,6 +4,7 @@
 
 # Data directories (created at runtime)
 .aids/
+aids-qa-*/
 
 # Node
 node_modules/

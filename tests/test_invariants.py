@@ -643,5 +643,83 @@ class TestIntegration_FullHookFlow(AIDSTestBase):
             self.assertIsNotNone(ratings[0].get("rater_session_id"), "INV-7 failed")
 
 
+# ============================================================
+# SignatureBackend + verify command
+# ============================================================
+class TestSignatureBackendAndVerify(AIDSTestBase):
+    """Test the SignatureBackend abstraction and verify command."""
+
+    def test_chain_hash_computed_on_write(self) -> None:
+        """Write traces include a chain_hash field."""
+        self._simulate_session_start()
+        self._simulate_write_flow(str(self.test_file), "# modified\n")
+
+        traces = self._traces_today()
+        self.assertGreater(len(traces), 0)
+        trace = traces[0]
+        self.assertIsNotNone(trace.get("chain_hash"), "chain_hash should be computed for new traces")
+
+    def test_chain_hash_changes_per_trace(self) -> None:
+        """Different traces produce different chain hashes."""
+        self._simulate_session_start()
+        self._simulate_write_flow(str(self.test_file), "# v1\n")
+        self._simulate_write_flow(str(self.test_file), "# v2\n")
+
+        traces = self._traces_today()
+        write_traces = [t for t in traces if t.get("operation") in ("modify", "create")]
+        self.assertGreaterEqual(len(write_traces), 2)
+
+        hashes = [t.get("chain_hash") for t in write_traces if t.get("chain_hash")]
+        self.assertGreaterEqual(len(hashes), 2)
+        unique_hashes = set(hashes)
+        self.assertEqual(len(unique_hashes), len(hashes), "Each trace should have a unique chain_hash")
+
+    def test_verify_all_passes(self) -> None:
+        """aids verify returns 0 when no tampering."""
+        self._simulate_session_start()
+        self._simulate_write_flow(str(self.test_file), "# clean\n")
+
+        result = _run_cli("verify", env=self.env)
+        self.assertEqual(result.returncode, 0, f"verify should pass: {result.stdout}{result.stderr}")
+        self.assertIn("verified", result.stdout.lower())
+
+    def test_verify_single_trace(self) -> None:
+        """aids verify <trace_id> verifies a specific trace."""
+        self._simulate_session_start()
+        self._simulate_write_flow(str(self.test_file), "# single\n")
+
+        traces = self._traces_today()
+        self.assertGreater(len(traces), 0)
+        trace_id = traces[0]["trace_id"]
+
+        result = _run_cli("verify", trace_id, env=self.env)
+        self.assertEqual(result.returncode, 0, f"verify <trace_id> should pass: {result.stdout}{result.stderr}")
+
+    def test_verify_detects_tampering(self) -> None:
+        """aids verify detects chain_hash tampering."""
+        self._simulate_session_start()
+        self._simulate_write_flow(str(self.test_file), "# tampered\n")
+
+        traces = self._traces_today()
+        self.assertGreater(len(traces), 0)
+        trace_id = traces[0]["trace_id"]
+
+        # Tamper: change trace_id in the file (which IS in chain_fields)
+        from datetime import date
+        trace_path = self._data_dir() / "traces" / f"{date.today().isoformat()}.jsonl"
+        lines = trace_path.read_text(encoding="utf-8").splitlines()
+        tampered = []
+        for line in lines:
+            d = json.loads(line.strip())
+            if d.get("trace_id") == trace_id:
+                d["trace_id"] = "TAMPERED"
+            tampered.append(json.dumps(d, ensure_ascii=False))
+        trace_path.write_text("\n".join(tampered) + "\n", encoding="utf-8")
+
+        result = _run_cli("verify", env=self.env)
+        self.assertNotEqual(result.returncode, 0, "verify should detect tampering")
+        self.assertIn("chain_hash mismatch", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

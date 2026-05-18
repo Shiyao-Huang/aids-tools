@@ -1071,5 +1071,431 @@ class TestCmdRateCLI(TempDataMixin, unittest.TestCase):
         self.assertEqual(rc2, 0, "Different rater should be allowed")
 
 
+# ─── compute_agent_id ───
+
+
+class TestComputeAgentId(unittest.TestCase):
+    def test_deterministic(self):
+        """Same inputs produce same agent_id."""
+        id1 = selftools.compute_agent_id("Frontend Agent", "implementer", "team-1")
+        id2 = selftools.compute_agent_id("Frontend Agent", "implementer", "team-1")
+        self.assertEqual(id1, id2)
+
+    def test_format_prefix(self):
+        """agent_id starts with 'agent-'."""
+        aid = selftools.compute_agent_id("Bot", "tester")
+        self.assertTrue(aid.startswith("agent-"), f"Expected 'agent-' prefix, got: {aid}")
+
+    def test_hash_length(self):
+        """agent_id has the expected format: 'agent-' + 16 hex chars."""
+        aid = selftools.compute_agent_id("Bot", "tester")
+        hex_part = aid[len("agent-"):]
+        self.assertEqual(len(hex_part), 16, f"Expected 16 hex chars, got: {hex_part}")
+        self.assertTrue(all(c in "0123456789abcdef" for c in hex_part))
+
+    def test_different_names_produce_different_ids(self):
+        id1 = selftools.compute_agent_id("Alice", "implementer")
+        id2 = selftools.compute_agent_id("Bob", "implementer")
+        self.assertNotEqual(id1, id2)
+
+    def test_different_roles_produce_different_ids(self):
+        id1 = selftools.compute_agent_id("Agent", "implementer")
+        id2 = selftools.compute_agent_id("Agent", "reviewer")
+        self.assertNotEqual(id1, id2)
+
+    def test_different_teams_produce_different_ids(self):
+        id1 = selftools.compute_agent_id("Agent", "implementer", "team-A")
+        id2 = selftools.compute_agent_id("Agent", "implementer", "team-B")
+        self.assertNotEqual(id1, id2)
+
+    def test_none_team_equals_empty_team(self):
+        id1 = selftools.compute_agent_id("Agent", "impl", None)
+        id2 = selftools.compute_agent_id("Agent", "impl", "")
+        self.assertEqual(id1, id2)
+
+    def test_empty_inputs_stable(self):
+        id1 = selftools.compute_agent_id("", "", "")
+        id2 = selftools.compute_agent_id("", "", "")
+        self.assertEqual(id1, id2)
+
+
+# ─── detect_query_target — agent-prefix ───
+
+
+class TestDetectQueryTargetAgentPrefix(TempDataMixin, unittest.TestCase):
+    def _register_agent_session(self, agent_id: str, session_id: str, role: str = "implementer") -> None:
+        """Create a session file with the given agent_id."""
+        record = {
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "role": role,
+            "runtime": "claude",
+            "status": "active",
+            "display_name": f"Agent-{agent_id[:8]}",
+        }
+        selftools.write_json_atomic(selftools.session_path(session_id), record)
+
+    def test_agent_prefix_returns_agent_kind(self):
+        """agent-<hex> query returns kind='agent'."""
+        aid = selftools.compute_agent_id("TestBot", "implementer")
+        self._register_agent_session(aid, "sess-agent-1")
+
+        result = selftools.detect_query_target(aid)
+        self.assertEqual(result["kind"], "agent")
+        self.assertEqual(result["id"], aid)
+        self.assertEqual(len(result["sessions"]), 1)
+        self.assertEqual(result["sessions"][0]["agent_id"], aid)
+
+    def test_agent_prefix_no_match_returns_unknown(self):
+        """agent-<hex> with no matching session falls through to unknown."""
+        result = selftools.detect_query_target("agent-deadbeef12345678")
+        # No session registered with this agent_id, so it should not resolve as "agent"
+        # It will try session lookup next, but "agent-deadbeef12345678" is not a valid session
+        self.assertNotEqual(result["kind"], "agent")
+
+    def test_agent_prefix_multiple_sessions(self):
+        """Multiple sessions with same agent_id are all returned."""
+        aid = selftools.compute_agent_id("MultiBot", "implementer", "team-1")
+        self._register_agent_session(aid, "sess-multi-1")
+        self._register_agent_session(aid, "sess-multi-2")
+
+        result = selftools.detect_query_target(aid)
+        self.assertEqual(result["kind"], "agent")
+        self.assertEqual(len(result["sessions"]), 2)
+
+    def test_trace_prefix_takes_priority_over_agent(self):
+        """tr_ prefix is resolved before agent- prefix."""
+        aid = selftools.compute_agent_id("TestBot", "implementer")
+        self._register_agent_session(aid, "sess-priority")
+
+        # Write a trace with tr_ prefix
+        trace = {
+            "trace_id": "tr_priority_test",
+            "session_id": "sess-priority",
+            "tool": "Write",
+            "resource_path": "/tmp/test.py",
+            "operation": "modify",
+            "intent": "priority test",
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+            "runtime": "claude",
+            "actor_type": "agent",
+        }
+        selftools.append_jsonl(selftools.traces_file_for_today(), trace)
+
+        result = selftools.detect_query_target(f"tr_priority_test {aid}")
+        self.assertEqual(result["kind"], "trace")
+        self.assertEqual(result["id"], "tr_priority_test")
+
+    def test_rating_prefix_takes_priority_over_agent(self):
+        """rt_ prefix is resolved before agent- prefix."""
+        aid = selftools.compute_agent_id("TestBot", "implementer")
+        self._register_agent_session(aid, "sess-rt-priority")
+
+        # Write a rating
+        rating = {
+            "rating_id": "rt_priority_test",
+            "trace_id": "tr_x",
+            "score": "good",
+            "comment": "test",
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+        }
+        selftools.append_jsonl(
+            selftools.data_dir() / "ratings" / f"{selftools.today()}.jsonl", rating
+        )
+
+        result = selftools.detect_query_target(f"rt_priority_test {aid}")
+        self.assertEqual(result["kind"], "rating")
+        self.assertEqual(result["id"], "rt_priority_test")
+
+    def test_agent_prefix_in_multi_token_query(self):
+        """agent-<hex> as any token in query triggers agent resolution."""
+        aid = selftools.compute_agent_id("TokenBot", "implementer")
+        self._register_agent_session(aid, "sess-token")
+
+        result = selftools.detect_query_target(f"some words {aid} more words")
+        self.assertEqual(result["kind"], "agent")
+        self.assertEqual(result["id"], aid)
+
+    def test_register_session_assigns_agent_id(self):
+        """register_session computes and stores agent_id."""
+        os.environ["AIDS_SESSION_ID"] = "sess-auto-aid"
+        os.environ["AIDS_DISPLAY_NAME"] = "AutoAgent"
+        os.environ["AIDS_ROLE"] = "implementer"
+        try:
+            record = selftools.register_session({"session_id": "sess-auto-aid", "cwd": "/tmp"}, source="test")
+            self.assertTrue(record["agent_id"].startswith("agent-"))
+
+            # Query by agent_id
+            result = selftools.detect_query_target(record["agent_id"])
+            self.assertEqual(result["kind"], "agent")
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
+
+
+# ─── Integration: aids verify ───
+
+
+class TestCmdVerifyIntegration(TempDataMixin, unittest.TestCase):
+    def _write_trace(self, trace_id, resource, operation="modify", session_id="s1"):
+        trace = {
+            "trace_id": trace_id,
+            "session_id": session_id,
+            "tool": "Write",
+            "resource_path": resource,
+            "operation": operation,
+            "intent": "verify test",
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+            "runtime": "claude",
+            "actor_type": "agent",
+            "role": "implementer",
+        }
+        selftools.append_jsonl(selftools.traces_file_for_today(), trace)
+        return trace
+
+    def test_verify_empty_traces(self):
+        """aids verify with no traces returns error code."""
+        args = selftools.build_parser().parse_args(["verify"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_verify(args)
+        self.assertEqual(rc, 1)
+
+    def test_verify_single_trace_passes(self):
+        """Single trace with valid chain_hash passes verification."""
+        trace = self._write_trace("tr_verify_1", "/tmp/verify.py")
+        # Ensure chain_hash exists (appended by post-tool-use in real flow)
+        # We need to compute it manually for unit test
+        selftools.ensure_layout()
+        from datetime import date
+        trace_path = selftools.data_dir() / "traces" / f"{date.today().isoformat()}.jsonl"
+        chain_hash = selftools._chain_hash_for_trace(trace, None)
+        trace["chain_hash"] = chain_hash
+        # Rewrite the trace file with chain_hash
+        lines = trace_path.read_text(encoding="utf-8").strip().splitlines()
+        updated = []
+        for line in lines:
+            d = json.loads(line)
+            if d.get("trace_id") == "tr_verify_1":
+                d["chain_hash"] = chain_hash
+            updated.append(json.dumps(d, ensure_ascii=False))
+        trace_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+
+        args = selftools.build_parser().parse_args(["verify"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_verify(args)
+        self.assertEqual(rc, 0, f"verify should pass: {captured.getvalue()}")
+        self.assertIn("verified", captured.getvalue().lower())
+
+    def test_verify_json_output(self):
+        """aids verify --json returns structured JSON output."""
+        trace = self._write_trace("tr_verify_json", "/tmp/verify_json.py")
+        chain_hash = selftools._chain_hash_for_trace(trace, None)
+        trace["chain_hash"] = chain_hash
+        from datetime import date
+        trace_path = selftools.data_dir() / "traces" / f"{date.today().isoformat()}.jsonl"
+        lines = trace_path.read_text(encoding="utf-8").strip().splitlines()
+        updated = []
+        for line in lines:
+            d = json.loads(line)
+            if d.get("trace_id") == "tr_verify_json":
+                d["chain_hash"] = chain_hash
+            updated.append(json.dumps(d, ensure_ascii=False))
+        trace_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+
+        args = selftools.build_parser().parse_args(["verify", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_verify(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertIn("total_traces", result)
+        self.assertIn("verified_ok", result)
+        self.assertIn("errors", result)
+        self.assertIn("config_violations", result)
+        self.assertTrue(result["passed"])
+
+    def test_verify_detects_tampered_trace(self):
+        """aids verify detects a tampered chain_hash."""
+        trace = self._write_trace("tr_tamper", "/tmp/tamper.py")
+        chain_hash = selftools._chain_hash_for_trace(trace, None)
+        from datetime import date
+        # Step 1: write chain_hash into the file
+        trace_path = selftools.data_dir() / "traces" / f"{date.today().isoformat()}.jsonl"
+        lines = trace_path.read_text(encoding="utf-8").strip().splitlines()
+        updated = []
+        for line in lines:
+            d = json.loads(line)
+            if d.get("trace_id") == "tr_tamper":
+                d["chain_hash"] = chain_hash
+            updated.append(json.dumps(d, ensure_ascii=False))
+        trace_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+        # Step 2: tamper — modify the trace_id (part of chain computation)
+        lines = trace_path.read_text(encoding="utf-8").strip().splitlines()
+        tampered = []
+        for line in lines:
+            d = json.loads(line)
+            if d.get("trace_id") == "tr_tamper":
+                d["trace_id"] = "TAMPERED_ID"
+            tampered.append(json.dumps(d, ensure_ascii=False))
+        trace_path.write_text("\n".join(tampered) + "\n", encoding="utf-8")
+
+        args = selftools.build_parser().parse_args(["verify", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_verify(args)
+        self.assertNotEqual(rc, 0, "verify should detect tampering")
+        result = json.loads(captured.getvalue())
+        self.assertGreater(len(result["errors"]), 0)
+
+    def test_verify_specific_trace_id(self):
+        """aids verify <trace_id> verifies only that trace."""
+        trace = self._write_trace("tr_specific", "/tmp/specific.py")
+        chain_hash = selftools._chain_hash_for_trace(trace, None)
+        trace["chain_hash"] = chain_hash
+        from datetime import date
+        trace_path = selftools.data_dir() / "traces" / f"{date.today().isoformat()}.jsonl"
+        lines = trace_path.read_text(encoding="utf-8").strip().splitlines()
+        updated = []
+        for line in lines:
+            d = json.loads(line)
+            if d.get("trace_id") == "tr_specific":
+                d["chain_hash"] = chain_hash
+            updated.append(json.dumps(d, ensure_ascii=False))
+        trace_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+
+        args = selftools.build_parser().parse_args(["verify", "tr_specific"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_verify(args)
+        self.assertEqual(rc, 0, f"verify <trace_id> should pass: {captured.getvalue()}")
+
+    def test_verify_nonexistent_trace(self):
+        """aids verify <nonexistent> returns error."""
+        args = selftools.build_parser().parse_args(["verify", "tr_ghost_xyz"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_verify(args)
+        self.assertEqual(rc, 1)
+
+    def test_verify_legacy_trace_without_chain_hash(self):
+        """Legacy traces without chain_hash pass verification."""
+        self._write_trace("tr_legacy", "/tmp/legacy.py")
+        # No chain_hash field — legacy trace
+
+        args = selftools.build_parser().parse_args(["verify", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_verify(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertTrue(result["passed"])
+
+
+# ─── Protected config keys ───
+
+
+class TestProtectedConfigKeys(unittest.TestCase):
+    def test_protected_keys_defined(self):
+        """PROTECTED_CONFIG_KEYS has expected entries."""
+        self.assertIn("signature.enabled", selftools.PROTECTED_CONFIG_KEYS)
+        self.assertIn("signature.strategy", selftools.PROTECTED_CONFIG_KEYS)
+        self.assertIn("impact.enabled", selftools.PROTECTED_CONFIG_KEYS)
+        self.assertTrue(selftools.PROTECTED_CONFIG_KEYS["signature.enabled"])
+        self.assertEqual(selftools.PROTECTED_CONFIG_KEYS["signature.strategy"], "hash_chain")
+        self.assertTrue(selftools.PROTECTED_CONFIG_KEYS["impact.enabled"])
+
+    def test_enforce_protected_config_overrides_false(self):
+        """_enforce_protected_config forces protected keys to required values."""
+        config = {
+            "signature": {"enabled": False, "strategy": "disabled"},
+            "impact": {"enabled": False},
+        }
+        result = selftools._enforce_protected_config(config)
+        self.assertTrue(result["signature"]["enabled"])
+        self.assertEqual(result["signature"]["strategy"], "hash_chain")
+        self.assertTrue(result["impact"]["enabled"])
+
+    def test_enforce_protected_config_creates_missing_keys(self):
+        """_enforce_protected_config creates missing nested structures."""
+        config = {}
+        result = selftools._enforce_protected_config(config)
+        self.assertTrue(result["signature"]["enabled"])
+        self.assertEqual(result["signature"]["strategy"], "hash_chain")
+        self.assertTrue(result["impact"]["enabled"])
+
+    def test_enforce_protected_config_idempotent(self):
+        """Enforcing on already-correct config is a no-op."""
+        config = {
+            "signature": {"enabled": True, "strategy": "hash_chain"},
+            "impact": {"enabled": True},
+        }
+        result = selftools._enforce_protected_config(config)
+        self.assertEqual(result, config)
+
+    def test_deep_merge_skips_protected_keys(self):
+        """_deep_merge_dict skips protected keys from override."""
+        base = {
+            "signature": {"enabled": True, "strategy": "hash_chain"},
+            "impact": {"enabled": True},
+        }
+        override = {
+            "signature": {"enabled": False, "strategy": "disabled"},
+            "impact": {"enabled": False},
+            "query": {"default_limit": 50},
+        }
+        result = selftools._deep_merge_dict(base, override)
+        # Protected keys must NOT be overridden
+        self.assertTrue(result["signature"]["enabled"])
+        self.assertEqual(result["signature"]["strategy"], "hash_chain")
+        self.assertTrue(result["impact"]["enabled"])
+        # Non-protected key IS overridden
+        self.assertEqual(result["query"]["default_limit"], 50)
+
+    def test_deep_merge_preserves_non_protected(self):
+        """Non-protected config values are merged normally."""
+        base = {"query": {"enabled_modules": ["identity"], "default_limit": 10}}
+        override = {"query": {"default_limit": 20, "extra_key": "val"}}
+        result = selftools._deep_merge_dict(base, override)
+        self.assertEqual(result["query"]["default_limit"], 20)
+        self.assertEqual(result["query"]["extra_key"], "val")
+        self.assertEqual(result["query"]["enabled_modules"], ["identity"])
+
+
+class TestProtectedConfigWithLoadAidsConfig(TempDataMixin, unittest.TestCase):
+    def test_load_config_enforces_protected(self):
+        """load_aids_config always enforces protected keys."""
+        config_path = selftools.data_dir() / "config.json"
+        selftools.write_json_atomic(config_path, {
+            "signature": {"enabled": False, "strategy": "disabled"},
+            "impact": {"enabled": False},
+            "query": {"default_limit": 99},
+        })
+        config = selftools.load_aids_config()
+        self.assertTrue(config["signature"]["enabled"])
+        self.assertEqual(config["signature"]["strategy"], "hash_chain")
+        self.assertTrue(config["impact"]["enabled"])
+        self.assertEqual(config["query"]["default_limit"], 99)
+
+    def test_load_config_empty_file(self):
+        """load_aids_config with missing/empty config returns defaults + protected."""
+        config = selftools.load_aids_config()
+        self.assertTrue(config["signature"]["enabled"])
+        self.assertEqual(config["signature"]["strategy"], "hash_chain")
+        self.assertTrue(config["impact"]["enabled"])
+
+
 if __name__ == "__main__":
     unittest.main()

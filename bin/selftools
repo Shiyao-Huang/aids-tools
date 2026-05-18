@@ -1176,9 +1176,6 @@ def hook_output(event_name: str, message: str, *, post: bool = False) -> None:
     hook_specific: Dict[str, Any] = {"hookEventName": event_name}
     if event_name in {"SessionStart", "PreToolUse", "PostToolUse"}:
         hook_specific["additionalContext"] = message
-    if post:
-        # Claude PostToolUse supports top-level additionalContext too.
-        out["additionalContext"] = message
     out["hookSpecificOutput"] = hook_specific
     print(json_line(out))
 
