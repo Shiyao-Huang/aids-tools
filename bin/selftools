@@ -3395,7 +3395,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
         cat_dir = dd / category
         if not cat_dir.exists():
             continue
-        for jf in cat_dir.glob("*.jsonl"):
+        for jf in list(cat_dir.glob("*.jsonl")) + list(cat_dir.glob("*.ndjson")):
             try:
                 if jf.stat().st_mtime < cutoff_ts:
                     _remove(jf, category)

@@ -116,14 +116,6 @@ run() {
   fi
 }
 
-run_shell() {
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf '[DRY-RUN] %s\n' "$*"
-  else
-    eval "$@"
-  fi
-}
-
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || error "$1 is required."
 }
@@ -196,6 +188,10 @@ clone_or_update() {
       printf '[DRY-RUN] git -C %q fetch/reset origin/main\n' "$INSTALL_DIR"
     else
       git -C "$INSTALL_DIR" fetch origin
+      if [ -n "$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null)" ]; then
+        info "Stashing local changes before reset..."
+        git -C "$INSTALL_DIR" stash --include-untracked --quiet 2>/dev/null || true
+      fi
       git -C "$INSTALL_DIR" reset --hard origin/main
     fi
   else

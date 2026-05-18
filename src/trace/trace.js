@@ -169,11 +169,8 @@ function appendLineAtomic(filePath, record) {
   ensureDir(path.dirname(filePath));
   const lockName = `append-${path.basename(filePath)}`;
   return withLock(lockName, () => {
-    const previous = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
     const line = `${JSON.stringify(record)}\n`;
-    const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmp, previous + line, 'utf8');
-    fs.renameSync(tmp, filePath);
+    fs.appendFileSync(filePath, line, 'utf8');
     return record;
   });
 }
