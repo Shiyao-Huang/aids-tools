@@ -643,6 +643,7 @@ function main(argv = process.argv.slice(2)) {
 
 module.exports = {
   TRACE_OPERATIONS,
+  DEFAULT_TRACE_SCAN_DAYS,
   appendTrace,
   getRecentTraces,
   getTraceChain,
@@ -655,6 +656,10 @@ module.exports = {
   appendTimelineEvent,
   traceFileForDate,
   readAllTraces,
+  parseTraceScanDays,
+  traceFileDate,
+  traceScanStartDate,
+  filterTraceFilesByDays,
 };
 
 if (require.main === module) {
