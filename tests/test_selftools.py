@@ -1515,6 +1515,19 @@ class TestCmdVerifyIntegration(TempDataMixin, unittest.TestCase):
         selftools.append_jsonl(selftools.traces_file_for_today(), trace)
         return trace
 
+    def _rewrite_trace_records(self, updates):
+        from datetime import date
+        trace_path = selftools.data_dir() / "traces" / f"{date.today().isoformat()}.jsonl"
+        lines = trace_path.read_text(encoding="utf-8").strip().splitlines()
+        rewritten = []
+        for line in lines:
+            record = json.loads(line)
+            patch = updates.get(record.get("trace_id"))
+            if patch:
+                record.update(patch)
+            rewritten.append(json.dumps(record, ensure_ascii=False))
+        trace_path.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+
     def test_verify_empty_traces(self):
         """aids verify with no traces returns error code."""
         args = selftools.build_parser().parse_args(["verify"])
@@ -1614,6 +1627,32 @@ class TestCmdVerifyIntegration(TempDataMixin, unittest.TestCase):
         self.assertNotEqual(rc, 0, "verify should detect tampering")
         result = json.loads(captured.getvalue())
         self.assertGreater(len(result["errors"]), 0)
+
+    def test_verify_treats_legacy_concurrent_fork_as_warning(self):
+        """Legacy concurrent writers can create a valid non-linear chain fork."""
+        base = self._write_trace("tr_fork_base", "/tmp/fork.py", session_id="s1")
+        base_hash = selftools._chain_hash_for_trace(base, None)
+        linear = self._write_trace("tr_fork_linear", "/tmp/fork.py", session_id="s1")
+        linear_hash = selftools._chain_hash_for_trace(linear, base_hash)
+        forked = self._write_trace("tr_fork_branch", "/tmp/fork.py", session_id="s2")
+        forked_hash = selftools._chain_hash_for_trace(forked, base_hash)
+        self._rewrite_trace_records({
+            "tr_fork_base": {"chain_hash": base_hash},
+            "tr_fork_linear": {"chain_hash": linear_hash},
+            "tr_fork_branch": {"chain_hash": forked_hash},
+        })
+
+        args = selftools.build_parser().parse_args(["verify", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_verify(args)
+        self.assertEqual(rc, 0, f"forked legacy chain should warn, not fail: {captured.getvalue()}")
+        result = json.loads(captured.getvalue())
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertEqual(result["warnings"][0]["parent_trace_id"], "tr_fork_base")
 
     def test_verify_specific_trace_id(self):
         """aids verify <trace_id> verifies only that trace."""

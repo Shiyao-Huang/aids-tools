@@ -601,6 +601,21 @@ def _chain_hash_for_trace(trace: Dict[str, Any], prev_chain_hash: Optional[str])
     return _signature_backend.compute(trace, prev_chain_hash)
 
 
+def _find_chain_fork_parent(
+    trace: Dict[str, Any],
+    stored_hash: str,
+    candidates: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the earlier chain state that validates a non-linear trace hash."""
+    for candidate in reversed(candidates):
+        candidate_hash = candidate.get("chain_hash")
+        if candidate_hash and _signature_backend.verify(trace, candidate_hash, stored_hash):
+            return candidate
+    if candidates and _signature_backend.verify(trace, None, stored_hash):
+        return {"trace_id": "GENESIS", "chain_hash": None}
+    return None
+
+
 def short(s: Any, n: int = 160) -> str:
     text = str(s or "")
     text = re.sub(r"\s+", " ", text).strip()
@@ -3541,8 +3556,7 @@ def _verify_single_trace(target_trace_id: str, *, as_json: bool = False) -> int:
 
     jsonl_files = sorted(traces_dir.glob("*.jsonl")) + sorted(traces_dir.glob("*.ndjson"))
     found: Optional[Dict[str, Any]] = None
-    resource_traces: List[Dict[str, Any]] = []
-    target_resource: Optional[str] = None
+    all_traces: List[Dict[str, Any]] = []
 
     for jf in jsonl_files:
         try:
@@ -3558,16 +3572,9 @@ def _verify_single_trace(target_trace_id: str, *, as_json: bool = False) -> int:
             except json.JSONDecodeError:
                 continue
             tid = trace.get("trace_id")
-            res = str(trace.get("resource_path") or "")
+            all_traces.append(trace)
             if tid == target_trace_id:
                 found = trace
-                target_resource = res
-            if target_resource and res == target_resource:
-                resource_traces.append(trace)
-            if found and tid == target_trace_id:
-                break
-        if found:
-            break
 
     if not found:
         if as_json:
@@ -3577,24 +3584,39 @@ def _verify_single_trace(target_trace_id: str, *, as_json: bool = False) -> int:
         return 1
 
     # Replay chain up to the target trace
+    target_resource = str(found.get("resource_path") or "")
     chain_state: Optional[str] = None
-    for tr in resource_traces:
+    candidates: List[Dict[str, Any]] = []
+    for tr in all_traces:
+        if str(tr.get("resource_path") or "") != target_resource:
+            continue
         if tr.get("trace_id") == target_trace_id:
             break
-        chain_state = tr.get("chain_hash") or None
+        prior_hash = tr.get("chain_hash") or None
+        chain_state = prior_hash
+        if prior_hash:
+            candidates.append({"trace_id": tr.get("trace_id"), "chain_hash": prior_hash})
+        else:
+            candidates = []
 
     stored_hash = found.get("chain_hash")
     if not stored_hash:
         result = {"trace_id": target_trace_id, "status": "legacy", "detail": "no chain_hash (legacy trace)"}
     elif _signature_backend.verify(found, chain_state, stored_hash):
         result = {"trace_id": target_trace_id, "status": "valid", "detail": "chain hash verified"}
+    elif _find_chain_fork_parent(found, stored_hash, candidates):
+        result = {
+            "trace_id": target_trace_id,
+            "status": "forked",
+            "detail": "chain hash verified against an earlier parent (legacy concurrent fork)",
+        }
     else:
         result = {"trace_id": target_trace_id, "status": "TAMPERED", "detail": "chain_hash mismatch: trace was tampered or chain broken"}
 
     if as_json:
         print(json_dump(result))
     else:
-        mark = "\u2705" if result["status"] in ("valid", "legacy") else "\u274c"
+        mark = "\u2705" if result["status"] in ("valid", "legacy") else ("!" if result["status"] == "forked" else "\u274c")
         print(f"{mark} {result['trace_id']}: {result['detail']}")
     return 0 if result["status"] != "TAMPERED" else 1
 
@@ -3625,11 +3647,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     total = 0
     ok_count = 0
+    warnings: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     # per-resource chain state: resource_path -> last verified chain_hash
     chain_state: Dict[str, Optional[str]] = {}
-    # global chain: trace_id -> chain_hash (for cross-resource detection)
-    global_prev_hash: Optional[str] = None
+    # per-resource known chain states for legacy fork detection.
+    chain_candidates: Dict[str, List[Dict[str, Any]]] = {}
 
     for jf in jsonl_files:
         try:
@@ -3655,20 +3678,44 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 prev = chain_state.get(resource)
                 expected_hash = _chain_hash_for_trace(trace, prev)
                 if expected_hash != stored_chain_hash:
-                    errors.append({
-                        "file": str(jf), "line": line_no,
-                        "trace_id": trace.get("trace_id"),
-                        "resource": resource,
-                        "error": "chain_hash mismatch: trace was tampered or chain broken",
-                        "expected": expected_hash,
-                        "stored": stored_chain_hash,
-                    })
+                    parent = _find_chain_fork_parent(
+                        trace,
+                        stored_chain_hash,
+                        chain_candidates.get(resource, []),
+                    )
+                    if parent:
+                        warnings.append({
+                            "file": str(jf), "line": line_no,
+                            "trace_id": trace.get("trace_id"),
+                            "resource": resource,
+                            "warning": "chain fork: hash matches an earlier parent, likely legacy concurrent write",
+                            "parent_trace_id": parent.get("trace_id"),
+                            "expected_linear": expected_hash,
+                            "stored": stored_chain_hash,
+                        })
+                        ok_count += 1
+                    else:
+                        errors.append({
+                            "file": str(jf), "line": line_no,
+                            "trace_id": trace.get("trace_id"),
+                            "resource": resource,
+                            "error": "chain_hash mismatch: trace was tampered or chain broken",
+                            "expected": expected_hash,
+                            "stored": stored_chain_hash,
+                        })
                 else:
                     ok_count += 1
                 chain_state[resource] = stored_chain_hash
+                chain_candidates.setdefault(resource, []).append({
+                    "trace_id": trace.get("trace_id"),
+                    "chain_hash": stored_chain_hash,
+                    "file": str(jf),
+                    "line": line_no,
+                })
             else:
                 # No chain_hash field — legacy trace, skip chain check
                 chain_state[resource] = None
+                chain_candidates[resource] = []
                 ok_count += 1
 
             # ── Check 2: file hash consistency (pre_hash matches previous post_hash) ──
@@ -3691,6 +3738,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(json_dump({
             "total_traces": total,
             "verified_ok": ok_count,
+            "warnings": warnings,
             "errors": errors,
             "config_violations": config_violations,
             "passed": len(errors) == 0 and len(config_violations) == 0,
@@ -3699,7 +3747,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"AIDS trace verification")
         print(f"  Total traces: {total}")
         print(f"  Verified OK: {ok_count}")
+        print(f"  Warnings: {len(warnings)}")
         print(f"  Errors: {len(errors)}")
+        for warn in warnings[:20]:
+            tid = warn.get("trace_id", "?")
+            print(f"    CHAIN FORK: {warn.get('file', '?')}:{warn.get('line', '?')} trace={tid}")
+            print(f"      {warn.get('warning', '')}; parent={warn.get('parent_trace_id', '?')}")
         for err in errors[:20]:
             tid = err.get("trace_id", "?")
             print(f"    CHAIN BROKEN: {err.get('file', '?')}:{err.get('line', '?')} trace={tid}")
@@ -3709,7 +3762,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
             for v in config_violations:
                 print(f"    PROTECTED KEY: {v['key']} = {v['actual']!r} (required: {v['required']!r})")
         if not errors and not config_violations:
-            print("  All traces verified. No tampering detected.")
+            if warnings:
+                print("  No tampering detected. Review warnings for legacy concurrent forks.")
+            else:
+                print("  All traces verified. No tampering detected.")
     return 0 if (not errors and not config_violations) else 1
 
 
