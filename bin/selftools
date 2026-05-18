@@ -2035,12 +2035,12 @@ def _csv_columns(kind: str, records: List[Dict[str, Any]]) -> List[str]:
         ],
     }[kind]
     seen = set(preferred)
-    extras = sorted(
+    extras = list(dict.fromkeys(
         key
         for rec in records
         for key in rec.keys()
         if key not in seen and not isinstance(rec.get(key), (dict, list))
-    )
+    ))
     return preferred + extras
 
 

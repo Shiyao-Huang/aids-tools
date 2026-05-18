@@ -403,7 +403,7 @@ config.parent.mkdir(parents=True, exist_ok=True)
 text = config.read_text(encoding="utf-8") if config.exists() else ""
 text = re.sub(r"\n?# (?:selftools|AIDS) MCP server BEGIN\n.*?# (?:selftools|AIDS) MCP server END\n?", "\n", text, flags=re.S)
 # Also remove any unmarked [mcp_servers.aids] block from older installs
-text = re.sub(r"\n?\[mcp_servers\.aids\][^\[]*", "\n", text)
+text = re.sub(r"\n?\[mcp_servers\.(?:aids|selftools)\b[^\]]*\][^\[]*", "\n", text)
 
 def toml_str(s):
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
@@ -493,6 +493,7 @@ from pathlib import Path
 path = Path(os.environ["CODEX_CONFIG"])
 text = path.read_text(encoding="utf-8")
 text = re.sub(r"\n?# (?:selftools|AIDS) MCP server BEGIN\n.*?# (?:selftools|AIDS) MCP server END\n?", "\n", text, flags=re.S)
+text = re.sub(r"\n?\[mcp_servers\.(?:aids|selftools)\b[^\]]*\][^\[]*", "\n", text)
 path.write_text(text.rstrip() + ("\n" if text.strip() else ""), encoding="utf-8")
 PY
 }
