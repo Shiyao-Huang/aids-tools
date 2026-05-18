@@ -1119,6 +1119,35 @@ class TestComputeAgentId(unittest.TestCase):
         self.assertEqual(id1, id2)
 
 
+class TestIdentityDisclosure(unittest.TestCase):
+    def test_identity_lines_include_agent_and_session(self):
+        lines = selftools.identity_lines({
+            "display_name": "Codex",
+            "role": "developer",
+            "runtime": "codex",
+            "model": "gpt-5.5",
+            "agent_id": "agent-abc123",
+            "session_id": "sess-1",
+        })
+        text = "\n".join(lines)
+        self.assertIn("agent_id=agent-abc123", text)
+        self.assertIn("session_id=sess-1", text)
+        self.assertIn("runtime=codex", text)
+
+    def test_compact_trace_keeps_visible_identity(self):
+        compact = selftools._compact_trace({
+            "trace_id": "tr_id",
+            "agent_id": "agent-abc123",
+            "display_name": "Codex",
+            "model": "gpt-5.5",
+            "role": "developer",
+            "runtime": "codex",
+        })
+        self.assertEqual(compact["agent_id"], "agent-abc123")
+        self.assertEqual(compact["display_name"], "Codex")
+        self.assertEqual(compact["model"], "gpt-5.5")
+
+
 # ─── detect_query_target — agent-prefix ───
 
 
@@ -1495,6 +1524,419 @@ class TestProtectedConfigWithLoadAidsConfig(TempDataMixin, unittest.TestCase):
         self.assertTrue(config["signature"]["enabled"])
         self.assertEqual(config["signature"]["strategy"], "hash_chain")
         self.assertTrue(config["impact"]["enabled"])
+
+
+# ─── infer_runtime ───
+
+
+class TestInferRuntime(TempDataMixin, unittest.TestCase):
+    def test_env_var_takes_priority(self):
+        """AIDS_RUNTIME env var overrides transcript_path heuristics."""
+        with patch.dict(os.environ, {"AIDS_RUNTIME": "claude"}):
+            result = selftools.infer_runtime({"transcript_path": "/home/.codex/sessions/1"})
+        self.assertEqual(result, "claude")
+
+    def test_codex_transcript_path(self):
+        """transcript_path containing '.codex' returns 'codex'."""
+        self._clear_runtime_env()
+        result = selftools.infer_runtime({"transcript_path": "/home/user/.codex/sessions/abc"})
+        self.assertEqual(result, "codex")
+
+    def test_claude_transcript_path(self):
+        """transcript_path containing '.claude' returns 'claude'."""
+        self._clear_runtime_env()
+        result = selftools.infer_runtime({"transcript_path": "/home/user/.claude/projects/xyz"})
+        self.assertEqual(result, "claude")
+
+    def test_claude_env_file(self):
+        """CLAUDE_ENV_FILE set → returns 'claude'."""
+        self._clear_runtime_env()
+        with patch.dict(os.environ, {"CLAUDE_ENV_FILE": "/tmp/env"}, clear=False):
+            # Remove any AIDS_RUNTIME that might be set
+            os.environ.pop("AIDS_RUNTIME", None)
+            os.environ.pop("AID_RUNTIME", None)
+            result = selftools.infer_runtime({})
+        self.assertEqual(result, "claude")
+
+    def test_unknown_when_no_clues(self):
+        """No env vars, no transcript_path, no CLAUDE_ENV_FILE → 'unknown'."""
+        self._clear_runtime_env()
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ["AIDS_RUNTIME", "AID_RUNTIME", "SELFTOOLS_RUNTIME", "ZHUYI_RUNTIME", "CLAUDE_ENV_FILE"]:
+                os.environ.pop(key, None)
+            result = selftools.infer_runtime({})
+        self.assertEqual(result, "unknown")
+
+    def test_empty_transcript_path_falls_through(self):
+        """Empty transcript_path does not match .codex or .claude."""
+        self._clear_runtime_env()
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ["AIDS_RUNTIME", "AID_RUNTIME", "SELFTOOLS_RUNTIME", "ZHUYI_RUNTIME", "CLAUDE_ENV_FILE"]:
+                os.environ.pop(key, None)
+            result = selftools.infer_runtime({"transcript_path": ""})
+        self.assertEqual(result, "unknown")
+
+    def test_priority_env_over_transcript(self):
+        """AIDS_RUNTIME='codex' overrides transcript_path with '.claude'."""
+        with patch.dict(os.environ, {"AIDS_RUNTIME": "codex"}):
+            result = selftools.infer_runtime({"transcript_path": "/home/.claude/proj"})
+        self.assertEqual(result, "codex")
+
+    def _clear_runtime_env(self):
+        """Remove runtime-related env vars for clean test."""
+        for key in ["AIDS_RUNTIME", "AID_RUNTIME", "SELFTOOLS_RUNTIME", "ZHUYI_RUNTIME", "CLAUDE_ENV_FILE"]:
+            os.environ.pop(key, None)
+
+
+# ─── infer_actor_type ───
+
+
+class TestInferActorType(TempDataMixin, unittest.TestCase):
+    def test_claude_is_agent(self):
+        self.assertEqual(selftools.infer_actor_type("claude"), "agent")
+
+    def test_codex_is_agent(self):
+        self.assertEqual(selftools.infer_actor_type("codex"), "agent")
+
+    def test_bash_with_session_id_is_human(self):
+        with patch.dict(os.environ, {"AIDS_SESSION_ID": "sess-1"}, clear=False):
+            # Clear actor_type env so it doesn't override
+            for key in ["AIDS_ACTOR_TYPE", "AID_ACTOR_TYPE", "SELFTOOLS_ACTOR_TYPE", "ZHUYI_ACTOR_TYPE"]:
+                os.environ.pop(key, None)
+            result = selftools.infer_actor_type("bash")
+        self.assertEqual(result, "human")
+
+    def test_bash_without_session_id(self):
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ["AIDS_SESSION_ID", "AID_SESSION_ID", "SESSION_ID", "SELFTOOLS_SESSION_ID", "ZHUYI_SESSION_ID"]:
+                os.environ.pop(key, None)
+            for key in ["AIDS_ACTOR_TYPE", "AID_ACTOR_TYPE", "SELFTOOLS_ACTOR_TYPE", "ZHUYI_ACTOR_TYPE"]:
+                os.environ.pop(key, None)
+            result = selftools.infer_actor_type("bash")
+        self.assertEqual(result, "bash")
+
+    def test_unknown_runtime_is_unknown_actor(self):
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ["AIDS_ACTOR_TYPE", "AID_ACTOR_TYPE", "SELFTOOLS_ACTOR_TYPE", "ZHUYI_ACTOR_TYPE"]:
+                os.environ.pop(key, None)
+            result = selftools.infer_actor_type("unknown")
+        self.assertEqual(result, "unknown")
+
+    def test_env_var_overrides(self):
+        with patch.dict(os.environ, {"AIDS_ACTOR_TYPE": "custom"}):
+            result = selftools.infer_actor_type("claude")
+        self.assertEqual(result, "custom")
+
+
+# ─── agent_id backfill in register_session ───
+
+
+class TestAgentIdBackfill(TempDataMixin, unittest.TestCase):
+    def test_fresh_session_gets_agent_id(self):
+        """New session registration computes agent_id."""
+        os.environ["AIDS_SESSION_ID"] = "sess-backfill-1"
+        os.environ["AIDS_DISPLAY_NAME"] = "BackfillBot"
+        os.environ["AIDS_ROLE"] = "implementer"
+        try:
+            record = selftools.register_session({"session_id": "sess-backfill-1", "cwd": "/tmp"}, source="test")
+            self.assertTrue(record["agent_id"].startswith("agent-"))
+            expected = selftools.compute_agent_id("BackfillBot", "implementer")
+            self.assertEqual(record["agent_id"], expected)
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
+
+    def test_reregistration_preserves_existing_agent_id(self):
+        """Re-registration preserves existing agent_id, does not recompute."""
+        os.environ["AIDS_SESSION_ID"] = "sess-preserve"
+        os.environ["AIDS_DISPLAY_NAME"] = "PreserveBot"
+        os.environ["AIDS_ROLE"] = "implementer"
+        try:
+            # First registration
+            r1 = selftools.register_session({"session_id": "sess-preserve", "cwd": "/tmp"}, source="test")
+            original_aid = r1["agent_id"]
+
+            # Change display name and re-register
+            os.environ["AIDS_DISPLAY_NAME"] = "NewNameBot"
+            r2 = selftools.register_session({"session_id": "sess-preserve", "cwd": "/tmp"}, source="test")
+
+            # agent_id should NOT change — it was already set
+            self.assertEqual(r2["agent_id"], original_aid)
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
+
+    def test_old_session_without_agent_id_gets_backfilled(self):
+        """Legacy session file without agent_id gets it backfilled on next registration."""
+        # Write a legacy session without agent_id
+        legacy = {
+            "session_id": "sess-legacy",
+            "runtime": "claude",
+            "role": "implementer",
+            "display_name": "LegacyBot",
+            "status": "active",
+        }
+        selftools.write_json_atomic(selftools.session_path("sess-legacy"), legacy)
+
+        os.environ["AIDS_SESSION_ID"] = "sess-legacy"
+        os.environ["AIDS_DISPLAY_NAME"] = "LegacyBot"
+        os.environ["AIDS_ROLE"] = "implementer"
+        try:
+            record = selftools.register_session({"session_id": "sess-legacy", "cwd": "/tmp"}, source="test")
+            # agent_id should now be present and match expected
+            self.assertIn("agent_id", record)
+            self.assertTrue(record["agent_id"].startswith("agent-"))
+            expected = selftools.compute_agent_id("LegacyBot", "implementer")
+            self.assertEqual(record["agent_id"], expected)
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
+
+    def test_agent_id_stable_across_multiple_sessions(self):
+        """Same (name, role, team) → same agent_id across different session IDs."""
+        os.environ["AIDS_ROLE"] = "architect"
+        try:
+            for i in range(3):
+                sid = f"sess-stable-{i}"
+                os.environ["AIDS_SESSION_ID"] = sid
+                os.environ["AIDS_DISPLAY_NAME"] = "StableBot"
+                record = selftools.register_session({"session_id": sid, "cwd": "/tmp"}, source="test")
+                expected = selftools.compute_agent_id("StableBot", "architect")
+                self.assertEqual(record["agent_id"], expected)
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
+
+    def test_different_agents_different_ids(self):
+        """Different display names produce different agent_ids."""
+        ids = set()
+        for name in ["Alice", "Bob", "Charlie"]:
+            sid = f"sess-diff-{name}"
+            os.environ["AIDS_SESSION_ID"] = sid
+            os.environ["AIDS_DISPLAY_NAME"] = name
+            os.environ["AIDS_ROLE"] = "implementer"
+            try:
+                record = selftools.register_session({"session_id": sid, "cwd": "/tmp"}, source="test")
+                ids.add(record["agent_id"])
+            finally:
+                os.environ.pop("AIDS_SESSION_ID", None)
+                os.environ.pop("AIDS_DISPLAY_NAME", None)
+                os.environ.pop("AIDS_ROLE", None)
+        self.assertEqual(len(ids), 3, "Each agent should have a unique agent_id")
+
+
+# ─── Stats with agent_id data ───
+
+
+class TestStatsAgentAggregation(TempDataMixin, unittest.TestCase):
+    def _seed_multi_agent(self):
+        """Seed sessions with agent_ids and traces for stats testing."""
+        dd = selftools.data_dir()
+
+        agents = [
+            ("Alpha", "implementer", "claude", "team-1"),
+            ("Alpha", "implementer", "claude", "team-1"),  # same agent, second session
+            ("Beta", "reviewer", "codex", "team-1"),
+            ("Gamma", "master", "claude", "team-2"),
+        ]
+        for i, (name, role, runtime, team) in enumerate(agents):
+            sid = f"stats-agent-{i}"
+            aid = selftools.compute_agent_id(name, role, team)
+            record = {
+                "session_id": sid,
+                "runtime": runtime,
+                "role": role,
+                "status": "active",
+                "display_name": name,
+                "agent_id": aid,
+                "team_id": team,
+                "started_at": selftools.now_ms(),
+                "started_iso": selftools.iso_now(),
+            }
+            selftools.write_json_atomic(dd / "sessions" / f"{sid}.json", record)
+
+        # Traces linked to sessions
+        today_file = selftools.traces_file_for_today()
+        trace_data = [
+            ("stats-agent-0", "claude", "modify"),
+            ("stats-agent-0", "claude", "read"),
+            ("stats-agent-1", "claude", "create"),     # same agent as agent-0
+            ("stats-agent-2", "codex", "modify"),
+            ("stats-agent-3", "claude", "execute"),
+        ]
+        for i, (sid, runtime, op) in enumerate(trace_data):
+            trace = {
+                "trace_id": f"tr_agg_{i}",
+                "session_id": sid,
+                "tool": "Write" if op != "execute" else "Bash",
+                "resource_path": f"/tmp/agg_{i}.py",
+                "operation": op,
+                "intent": "aggregation test",
+                "timestamp": selftools.now_ms(),
+                "timestamp_iso": selftools.iso_now(),
+                "runtime": runtime,
+                "actor_type": "agent",
+            }
+            selftools.append_jsonl(today_file, trace)
+
+    def test_stats_json_includes_all_sessions(self):
+        """Stats JSON counts all sessions including multi-session agents."""
+        self._seed_multi_agent()
+        args = selftools.build_parser().parse_args(["stats", "--all", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_stats(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["sessions"]["total"], 4)
+
+    def test_stats_by_runtime_counts(self):
+        """Stats groups traces by runtime correctly."""
+        self._seed_multi_agent()
+        args = selftools.build_parser().parse_args(["stats", "--all", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            selftools.cmd_stats(args)
+        result = json.loads(captured.getvalue())
+        # 4 claude traces + 1 codex trace
+        self.assertEqual(result["traces"]["total"], 5)
+        self.assertEqual(result["traces"]["by_runtime"]["claude"], 4)
+        self.assertEqual(result["traces"]["by_runtime"]["codex"], 1)
+
+    def test_stats_by_role_from_sessions(self):
+        """Stats groups sessions by role correctly."""
+        self._seed_multi_agent()
+        args = selftools.build_parser().parse_args(["stats", "--all", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            selftools.cmd_stats(args)
+        result = json.loads(captured.getvalue())
+        by_role = result["sessions"]["by_role"]
+        self.assertEqual(by_role["implementer"], 2)  # agent-0 and agent-1
+        self.assertEqual(by_role["reviewer"], 1)
+        self.assertEqual(by_role["master"], 1)
+
+    def test_stats_top_sessions_enriched(self):
+        """Top sessions include display_name and role."""
+        self._seed_multi_agent()
+        args = selftools.build_parser().parse_args(["stats", "--all", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            selftools.cmd_stats(args)
+        result = json.loads(captured.getvalue())
+        top = result["top_sessions"]
+        self.assertGreater(len(top), 0)
+        for s in top:
+            self.assertIn("session_id", s)
+            self.assertIn("ops", s)
+            self.assertIn("role", s)
+            self.assertIn("runtime", s)
+
+    def test_stats_unknown_runtime_traces(self):
+        """Traces with runtime='unknown' are counted correctly."""
+        today_file = selftools.traces_file_for_today()
+        trace = {
+            "trace_id": "tr_unknown_rt",
+            "session_id": "sess-unknown",
+            "tool": "Bash",
+            "resource_path": "/tmp/unknown_rt.py",
+            "operation": "execute",
+            "intent": "unknown runtime test",
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+            "runtime": "unknown",
+            "actor_type": "agent",
+        }
+        selftools.append_jsonl(today_file, trace)
+
+        args = selftools.build_parser().parse_args(["stats", "--all", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            selftools.cmd_stats(args)
+        result = json.loads(captured.getvalue())
+        self.assertGreaterEqual(result["traces"]["by_runtime"].get("unknown", 0), 1)
+
+    def test_stats_by_agent_manual_aggregation(self):
+        """Verify agent_id-based aggregation by manual grouping of session data."""
+        self._seed_multi_agent()
+        args = selftools.build_parser().parse_args(["stats", "--all", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            selftools.cmd_stats(args)
+        result = json.loads(captured.getvalue())
+
+        # Manually aggregate top_sessions by agent_id via session lookup
+        dd = selftools.data_dir()
+        agent_trace_counts = {}
+        for f in (dd / "sessions").glob("*.json"):
+            rec = selftools.read_json(f, {}) or {}
+            aid = rec.get("agent_id", "unknown")
+            agent_trace_counts[aid] = agent_trace_counts.get(aid, 0)
+
+        # Alpha has 2 sessions, Beta 1, Gamma 1
+        alpha_id = selftools.compute_agent_id("Alpha", "implementer", "team-1")
+        beta_id = selftools.compute_agent_id("Beta", "reviewer", "team-1")
+        gamma_id = selftools.compute_agent_id("Gamma", "master", "team-2")
+
+        # Verify each agent has an entry
+        self.assertIn(alpha_id, agent_trace_counts)
+        self.assertIn(beta_id, agent_trace_counts)
+        self.assertIn(gamma_id, agent_trace_counts)
+
+        # Alpha should be the same agent_id for both sessions
+        sess0 = selftools.load_session("stats-agent-0")
+        sess1 = selftools.load_session("stats-agent-1")
+        self.assertEqual(sess0["agent_id"], sess1["agent_id"])
+        self.assertEqual(sess0["agent_id"], alpha_id)
+
+    def test_stats_resources_count(self):
+        """Stats counts unique resources correctly."""
+        self._seed_multi_agent()
+        args = selftools.build_parser().parse_args(["stats", "--all", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            selftools.cmd_stats(args)
+        result = json.loads(captured.getvalue())
+        self.assertGreaterEqual(result["resources"]["unique"], 5)
+        self.assertGreater(len(result["resources"]["top"]), 0)
+
+
+# ─── register_session runtime backfill ───
+
+
+class TestRegisterSessionRuntimeBackfill(TempDataMixin, unittest.TestCase):
+    def test_unknown_runtime_preserves_old(self):
+        """When infer_runtime returns 'unknown', old runtime is preserved."""
+        # Create session with known runtime
+        os.environ["AIDS_SESSION_ID"] = "sess-rt-back"
+        os.environ["AIDS_DISPLAY_NAME"] = "RtBot"
+        os.environ["AIDS_ROLE"] = "implementer"
+        os.environ["AIDS_RUNTIME"] = "claude"
+        try:
+            r1 = selftools.register_session({"session_id": "sess-rt-back", "cwd": "/tmp"}, source="test")
+            self.assertEqual(r1["runtime"], "claude")
+
+            # Re-register without runtime info — should keep claude
+            os.environ.pop("AIDS_RUNTIME", None)
+            for key in ["AIDS_RUNTIME", "AID_RUNTIME", "SELFTOOLS_RUNTIME", "ZHUYI_RUNTIME", "CLAUDE_ENV_FILE"]:
+                os.environ.pop(key, None)
+            r2 = selftools.register_session({"session_id": "sess-rt-back", "cwd": "/tmp"}, source="test")
+            self.assertEqual(r2["runtime"], "claude", "Runtime should be preserved from previous registration")
+        finally:
+            os.environ.pop("AIDS_SESSION_ID", None)
+            os.environ.pop("AIDS_DISPLAY_NAME", None)
+            os.environ.pop("AIDS_ROLE", None)
 
 
 if __name__ == "__main__":
