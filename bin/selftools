@@ -619,6 +619,10 @@ def session_id_from(event: Dict[str, Any]) -> str:
 
 def session_path(session_id: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id)
+    # Filesystems limit filenames to 255 bytes; use hash if too long (like index_key)
+    if len(safe.encode("utf-8")) > 200:
+        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+        safe = f"sha256-{digest}"
     return data_dir() / "sessions" / f"{safe}.json"
 
 
@@ -646,9 +650,9 @@ def register_session(event: Dict[str, Any], *, source: str = "hook") -> Dict[str
         {
             "session_id": sid,
             "runtime": runtime if runtime != "unknown" else old.get("runtime", runtime),
-            "model": event.get("model") or old.get("model") or env_first("AIDS_MODEL", "AID_MODEL", "SELFTOOLS_MODEL", "ZHUYI_MODEL", "MODEL_ID", "ANTHROPIC_MODEL", "DEFAULT_MODEL", "AHA_MODEL"),
+            "model": event.get("model") or old.get("model") or env_first("AIDS_MODEL", "AID_MODEL", "SELFTOOLS_MODEL", "ZHUYI_MODEL", "MODEL_ID", "CLAUDE_MODEL", "CODEX_MODEL", "ANTHROPIC_MODEL", "DEFAULT_MODEL", "AHA_MODEL"),
             "display_name": os.environ.get("AIDS_DISPLAY_NAME") or os.environ.get("AHA_SESSION_NAME") or os.environ.get("AID_DISPLAY_NAME") or os.environ.get("SELFTOOLS_DISPLAY_NAME") or os.environ.get("ZHUYI_DISPLAY_NAME") or (old.get("display_name") if old.get("display_name") not in (None, "", "unknown", "unspecified") else None) or sid,
-            "role": os.environ.get("AIDS_ROLE") or os.environ.get("AID_ROLE") or os.environ.get("AHA_AGENT_ROLE") or os.environ.get("ROLE") or os.environ.get("SELFTOOLS_ROLE") or os.environ.get("ZHUYI_ROLE") or os.environ.get("AHA_ROLE") or (old.get("role") if old.get("role") not in (None, "", "unknown", "unspecified") else None) or "unknown",
+            "role": os.environ.get("AIDS_ROLE") or os.environ.get("AID_ROLE") or os.environ.get("AHA_AGENT_ROLE") or os.environ.get("ROLE") or os.environ.get("SELFTOOLS_ROLE") or os.environ.get("ZHUYI_ROLE") or os.environ.get("AHA_ROLE") or (old.get("role") if old.get("role") not in (None, "", "unknown", "unspecified") else None) or "developer",
             "actor_type": actor_type,
             "team_id": env_first("AIDS_TEAM_ID", "AID_TEAM_ID", "TEAM_ID", "SELFTOOLS_TEAM_ID", "ZHUYI_TEAM_ID", "AHA_TEAM_ID") or old.get("team_id"),
             "task_id": env_first("AIDS_TASK_ID", "AID_TASK_ID", "TASK_ID", "SELFTOOLS_TASK_ID", "ZHUYI_TASK_ID", "AHA_TASK_ID") or old.get("task_id"),
@@ -3215,7 +3219,7 @@ def cmd_impact(args: argparse.Namespace) -> int:
 def cmd_commit_stamp(_: argparse.Namespace) -> int:
     """Output git Co-Authored-By trailer with current session identity."""
     sid = current_session_id() or "unknown"
-    role = env_first("AIDS_ROLE", "AID_ROLE", "AHA_AGENT_ROLE", "ROLE", "SELFTOOLS_ROLE", "ZHUYI_ROLE", "AHA_ROLE") or "unknown"
+    role = env_first("AIDS_ROLE", "AID_ROLE", "AHA_AGENT_ROLE", "ROLE", "SELFTOOLS_ROLE", "ZHUYI_ROLE", "AHA_ROLE") or "developer"
     name = env_first("AIDS_DISPLAY_NAME", "AHA_SESSION_NAME", "AID_DISPLAY_NAME", "SELFTOOLS_DISPLAY_NAME", "ZHUYI_DISPLAY_NAME") or sid[:12]
     runtime = env_first("AIDS_RUNTIME", "AID_RUNTIME", "SELFTOOLS_RUNTIME", "ZHUYI_RUNTIME") or "unknown"
     print(f"Co-Authored-By: {name} ({role}/{runtime}) <aids:{sid}@agent>")
@@ -3419,13 +3423,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     codex_config = codex_home / "config.toml"
     # Claude hooks can be registered via settings.json OR via standalone hook scripts in hooks/
     claude_hook_ok = file_contains(claude_settings, "selftools") or file_contains(claude_settings, "aids")
+    claude_hook_detail = str(claude_settings)
     if not claude_hook_ok:
         for hname in ("selftools-session-start.sh", "selftools-pre-tool-use.sh", "selftools-post-tool-use.sh"):
             hp = claude_home / "hooks" / hname
             if hp.exists() and os.access(hp, os.X_OK):
                 claude_hook_ok = True
+                claude_hook_detail = f"hooks/{hname} (standalone)"
                 break
-    checks.append(check("claude_settings", claude_hook_ok, str(claude_settings)))
+    checks.append(check("claude_settings", claude_hook_ok, claude_hook_detail))
     checks.append(check("codex_hooks", file_contains(codex_hooks_json, "selftools") or file_contains(codex_hooks_json, "aids"), str(codex_hooks_json)))
     checks.append(check("codex_mcp", file_contains(codex_config, "mcp_servers.selftools") or file_contains(codex_config, "mcp_servers.aids"), str(codex_config)))
     # ── Hook scripts executable ──
