@@ -276,6 +276,35 @@ class TestDetectResources(unittest.TestCase):
         result = selftools.detect_resources("Bash", {"command": "printf hi > out.txt"}, "/tmp")
         self.assertTrue(any(r.endswith("/tmp/out.txt") for r in result))
 
+    def test_bash_redirect_stderr(self):
+        result = selftools.detect_resources("Bash", {"command": "cmd 2> err.log"}, "/tmp")
+        self.assertTrue(any(r.endswith("/tmp/err.log") for r in result))
+
+    def test_bash_redirect_stderr_append(self):
+        result = selftools.detect_resources("Bash", {"command": "cmd 2>> err.log"}, "/tmp")
+        self.assertTrue(any(r.endswith("/tmp/err.log") for r in result))
+
+    def test_bash_redirect_all(self):
+        result = selftools.detect_resources("Bash", {"command": "cmd &> all.log"}, "/tmp")
+        self.assertTrue(any(r.endswith("/tmp/all.log") for r in result))
+
+    def test_bash_redirect_all_append(self):
+        result = selftools.detect_resources("Bash", {"command": "cmd &>> all.log"}, "/tmp")
+        self.assertTrue(any(r.endswith("/tmp/all.log") for r in result))
+
+    def test_bash_attached_redirect(self):
+        result = selftools.detect_resources("Bash", {"command": "echo hi >out.txt"}, "/tmp")
+        self.assertTrue(any(r.endswith("/tmp/out.txt") for r in result))
+
+    def test_bash_attached_stderr_redirect(self):
+        result = selftools.detect_resources("Bash", {"command": "cmd 2>err.log"}, "/tmp")
+        self.assertTrue(any(r.endswith("/tmp/err.log") for r in result))
+
+    def test_bash_multiple_redirects(self):
+        result = selftools.detect_resources("Bash", {"command": "cmd > out.txt 2> err.log"}, "/tmp")
+        paths = [r for r in result if not r.startswith("bash:")]
+        self.assertEqual(len(paths), 2)
+
     def test_mcp_tool(self):
         result = selftools.detect_resources("mcp__pencil_batch_design", {"filePath": "test.pen"}, "/tmp")
         self.assertTrue(any(r.startswith("mcp:") for r in result))
