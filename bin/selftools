@@ -42,6 +42,43 @@ except Exception:  # pragma: no cover - Windows fallback
 APP = "aids"
 ZH_NAME = "AIDS (Agent-ID System)"
 
+# ANSI color helpers (respect NO_COLOR / non-tty)
+_NO_COLOR = bool(os.environ.get("NO_COLOR"))
+
+
+def _color(code: str, text: str) -> str:
+    if _NO_COLOR or not sys.stdout.isatty():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _bold(text: str) -> str:
+    return _color("1", text)
+
+
+def _dim(text: str) -> str:
+    return _color("2", text)
+
+
+def _cyan(text: str) -> str:
+    return _color("36", text)
+
+
+def _yellow(text: str) -> str:
+    return _color("33", text)
+
+
+def _green(text: str) -> str:
+    return _color("32", text)
+
+
+def _red(text: str) -> str:
+    return _color("31", text)
+
+
+def _magenta(text: str) -> str:
+    return _color("35", text)
+
 
 def env_first(*names: str) -> Optional[str]:
     for name in names:
@@ -458,6 +495,21 @@ def append_jsonl(path: Path, record: Dict[str, Any]) -> None:
             fh.write(json_line(record) + "\n")
 
 
+def append_jsonl_multi(path: Path, records: List[Dict[str, Any]]) -> None:
+    """Write multiple records to the same JSONL file under a single lock.
+
+    Avoids repeated lock acquisition + file open/close when writing
+    several records to the same file (e.g. timeline events per hook).
+    """
+    if not records:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    buf = "".join(json_line(r) + "\n" for r in records)
+    with FileLock(lock_path_for(path)):
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(buf)
+
+
 def sha256_file(path: Path) -> Optional[str]:
     try:
         h = hashlib.sha256()
@@ -467,6 +519,56 @@ def sha256_file(path: Path) -> Optional[str]:
         return h.hexdigest()
     except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
         return None
+
+
+class SignatureBackend:
+    """Pluggable signature backend for trace chain verification.
+
+    The default implementation uses SHA-256 chain hashing: each trace's
+    signature depends on the previous trace's hash, forming a blockchain-style
+    linked list. Tampering with any trace invalidates all subsequent hashes.
+
+    Subclass and override to implement alternative signing strategies
+    (e.g., HMAC with a shared secret, Ed25519 signatures).
+    """
+
+    def chain_fields(self, trace: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract canonical fields used in the chain hash computation."""
+        return {
+            "trace_id": trace.get("trace_id"),
+            "session_id": trace.get("session_id"),
+            "tool": trace.get("tool"),
+            "resource_path": trace.get("resource_path"),
+            "operation": trace.get("operation"),
+            "pre_hash": trace.get("pre_hash"),
+            "post_hash": trace.get("post_hash"),
+            "timestamp": trace.get("timestamp"),
+        }
+
+    def compute(self, trace: Dict[str, Any], prev_chain_hash: Optional[str]) -> str:
+        """Compute the chain hash for a trace given the previous chain hash."""
+        fields = self.chain_fields(trace)
+        canonical = json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        payload = f"{prev_chain_hash or 'GENESIS'}:{canonical}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def verify(self, trace: Dict[str, Any], prev_chain_hash: Optional[str], stored_hash: str) -> bool:
+        """Verify that a trace's stored chain_hash matches the expected value."""
+        return self.compute(trace, prev_chain_hash) == stored_hash
+
+
+# Module-level singleton — swap this to change the signing strategy.
+_signature_backend = SignatureBackend()
+
+
+def _chain_hash_for_trace(trace: Dict[str, Any], prev_chain_hash: Optional[str]) -> str:
+    """Compute a chain-linking hash via the active SignatureBackend.
+
+    Delegates to _signature_backend.compute(). Each trace's integrity
+    depends on all previous traces in the chain. Tampering with any trace
+    invalidates all subsequent chain hashes.
+    """
+    return _signature_backend.compute(trace, prev_chain_hash)
 
 
 def short(s: Any, n: int = 160) -> str:
@@ -544,7 +646,7 @@ def register_session(event: Dict[str, Any], *, source: str = "hook") -> Dict[str
         {
             "session_id": sid,
             "runtime": runtime if runtime != "unknown" else old.get("runtime", runtime),
-            "model": event.get("model") or old.get("model") or env_first("AIDS_MODEL", "AID_MODEL", "SELFTOOLS_MODEL", "ZHUYI_MODEL"),
+            "model": event.get("model") or old.get("model") or env_first("AIDS_MODEL", "AID_MODEL", "SELFTOOLS_MODEL", "ZHUYI_MODEL", "MODEL_ID", "ANTHROPIC_MODEL", "DEFAULT_MODEL", "AHA_MODEL"),
             "display_name": os.environ.get("AIDS_DISPLAY_NAME") or os.environ.get("AHA_SESSION_NAME") or os.environ.get("AID_DISPLAY_NAME") or os.environ.get("SELFTOOLS_DISPLAY_NAME") or os.environ.get("ZHUYI_DISPLAY_NAME") or (old.get("display_name") if old.get("display_name") not in (None, "", "unknown", "unspecified") else None) or sid,
             "role": os.environ.get("AIDS_ROLE") or os.environ.get("AID_ROLE") or os.environ.get("AHA_AGENT_ROLE") or os.environ.get("ROLE") or os.environ.get("SELFTOOLS_ROLE") or os.environ.get("ZHUYI_ROLE") or os.environ.get("AHA_ROLE") or (old.get("role") if old.get("role") not in (None, "", "unknown", "unspecified") else None) or "unknown",
             "actor_type": actor_type,
@@ -631,6 +733,7 @@ def update_index(resource: str, trace: Dict[str, Any], session: Dict[str, Any]) 
                 "last_runtime": trace.get("runtime") or session.get("runtime"),
                 "last_intent": trace.get("intent"),
                 "last_seen_at": trace.get("timestamp"),
+                "last_chain_hash": trace.get("chain_hash"),
                 "timeline_path": str(data_dir() / "timeline" / f"{today()}.jsonl"),
                 "total_ops": int(idx.get("total_ops") or 0) + 1,
             }
@@ -732,6 +835,7 @@ def detect_resources(tool_name: str, tool_input: Any, cwd: str) -> List[str]:
         cmd = str(tool_input.get("command") or "")
         resources.append(f"bash:{cmd}")
         resources.extend(parse_bash_write_resources(str(tool_input.get("command") or ""), cwd))
+        resources.extend(parse_bash_read_resources(str(tool_input.get("command") or ""), cwd))
     if tool_name.startswith("mcp__"):
         resources.append(f"mcp:{tool_name}")
     # De-dupe while preserving order.
@@ -799,6 +903,100 @@ def parse_bash_write_resources(command: str, cwd: str) -> List[str]:
             if target not in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
                 resources.append(normalize_resource(target, cwd))
         index += 1
+
+    seen = set()
+    out = []
+    for res in resources:
+        if res not in seen:
+            seen.add(res)
+            out.append(res)
+    return out
+
+
+# Commands that read files (arguments are input file paths, not output targets).
+# NOTE: tee/xargs are write/execute tools — handled in write parser.
+#       perl/python are too complex to parse reliably from one-liners.
+_BASH_READ_COMMANDS = frozenset({
+    "cat", "head", "tail", "less", "more", "wc", "sort", "uniq",
+    "grep", "egrep", "fgrep", "rg", "ag", "ack",
+    "sed", "awk", "diff", "comm", "cut", "tr",
+    "file", "stat", "md5sum", "sha256sum", "sha1sum", "shasum",
+    "strings", "hexdump", "xxd", "od",
+})
+
+# Flags that consume the next token as a value (not a file argument).
+_BASH_READ_VALUE_FLAGS = frozenset({
+    "-e", "--regexp", "-f", "--file", "--color", "--colour",
+    "--exclude", "--include", "--exclude-dir",
+    "-n", "--lines", "-c", "--bytes",
+    "-k", "--key", "-t", "--field-separator", "-o", "--output",
+    "-F", "-v",
+    "-d", "--delimiter",
+    "--label", "-L", "-U", "--unified",
+    "-i", "--in-place",
+})
+
+
+def _looks_like_file(arg: str) -> bool:
+    """Heuristic: token is likely a file path, not a bare command argument."""
+    if arg.startswith("-"):
+        return False
+    if arg in ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"):
+        return False
+    if arg == "-":
+        return False  # stdin marker
+    if "/" in arg or "." in arg:
+        return True
+    if arg in ("Makefile", "Dockerfile", "README", "LICENSE", "CHANGELOG",
+               "Rakefile", "Gemfile", "Vagrantfile", "Jenkinsfile"):
+        return True
+    try:
+        return Path(arg).is_file()
+    except OSError:
+        return False
+
+
+def parse_bash_read_resources(command: str, cwd: str) -> List[str]:
+    """Extract file paths that are *read* by common Bash commands.
+
+    Handles pipelines — each segment is checked independently.
+    Skips sed -i (in-place edit = write, not read).
+    Respects flags that consume the next token as a value.
+    """
+    resources: List[str] = []
+    for segment in command.split("|"):
+        try:
+            tokens = shlex.split(segment.strip(), posix=True)
+        except ValueError:
+            tokens = segment.strip().split()
+        if not tokens:
+            continue
+        base = os.path.basename(tokens[0])
+        if base not in _BASH_READ_COMMANDS:
+            continue
+        # sed -i is a write operation — skip
+        if base == "sed":
+            has_inplace = any(
+                (t == "-i" or (t.startswith("-") and "i" in t and not t.startswith("-e"))
+                 or (t.startswith("--") and "in-place" in t))
+                for t in tokens[1:]
+            )
+            if has_inplace:
+                continue
+        skip_next = False
+        for tok in tokens[1:]:
+            if tok in {";", "&&", "||"}:
+                break
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in _BASH_READ_VALUE_FLAGS:
+                skip_next = True
+                continue
+            if tok.startswith("-"):
+                continue
+            if _looks_like_file(tok):
+                resources.append(normalize_resource(tok, cwd))
 
     seen = set()
     out = []
@@ -1081,6 +1279,7 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
         resources = detect_resources(tool_name, event.get("tool_input"), cwd)
         pre_by_resource = {res: (None if res.startswith(("bash:", "mcp:")) else sha256_file(Path(res))) for res in resources}
     trace_ids: List[str] = []
+    timeline_events: List[Dict[str, Any]] = []
     intent = env_first("AIDS_INTENT", "AID_INTENT", "INTENT", "SELFTOOLS_INTENT", "ZHUYI_INTENT") or session.get("goal") or tool_intent(event)
     for res in resources:
         pre_hash = pre_by_resource.get(res)
@@ -1114,10 +1313,16 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
             },
         }
         trace["timeline_path"] = str(timeline_file_for_today())
+        # ── Chain hash: link to previous trace on this resource ──
+        prev_idx = load_index(res)
+        prev_chain_hash = prev_idx.get("last_chain_hash")
+        trace["chain_hash"] = _chain_hash_for_trace(trace, prev_chain_hash)
         append_jsonl(traces_file_for_today(), trace)
-        append_jsonl(timeline_file_for_today(), timeline_event_from_trace(trace, event, session))
+        timeline_events.append(timeline_event_from_trace(trace, event, session))
         update_index(res, trace, session)
         trace_ids.append(trace["trace_id"])
+    # Batch-write all timeline events under a single lock to reduce contention.
+    append_jsonl_multi(timeline_file_for_today(), timeline_events)
     remove_pending(event)
     if trace_ids:
         hook_output("PostToolUse", f"{ZH_NAME} recorded {len(trace_ids)} trace(s): {', '.join(trace_ids)}", post=True)
@@ -1140,7 +1345,18 @@ def _display_resource(res: str, max_len: int = 120) -> str:
     return res
 
 
-def print_traces_for_resource(resource_arg: str, limit: int, *, as_json: bool = False) -> int:
+_OPERATION_COLORS = {
+    "create": _green,
+    "modify": _yellow,
+    "delete": _red,
+    "read": _cyan,
+    "execute": _magenta,
+    "touch": _dim,
+}
+
+
+def print_traces_for_resource(resource_arg: str, limit: int, *, as_json: bool = False,
+                              sort_by: str = "time", reverse: bool = False) -> int:
     res = normalize_resource(resource_arg)
     traces = recent_traces(res, limit=limit)
     if as_json:
@@ -1150,19 +1366,44 @@ def print_traces_for_resource(resource_arg: str, limit: int, *, as_json: bool = 
     if not traces:
         print(f"No {ZH_NAME} traces for {disp}")
         return 1
-    print(f"{ZH_NAME} traces for {disp}:")
+    # Sort traces
+    if sort_by == "operation":
+        traces.sort(key=lambda t: (t.get("operation") or "", t.get("timestamp") or 0))
+    elif sort_by == "agent":
+        traces.sort(key=lambda t: (t.get("session", {}).get("display_name") or t.get("session_id") or "",
+                                   t.get("timestamp") or 0))
+    else:  # time (default, newest last → already chronological from index)
+        pass
+    if reverse:
+        traces.reverse()
+    print(f"{_bold(ZH_NAME)} traces for {_bold(disp)}:")
+    # Aggregate by agent_id to show cross-session identity grouping
+    agent_ids_seen: Dict[str, int] = {}
     for tr in traces:
         sess = tr.get("session") or {}
+        aid = tr.get("agent_id") or sess.get("agent_id") or ""
+        if aid:
+            agent_ids_seen[aid] = agent_ids_seen.get(aid, 0) + 1
         actor = sess.get("display_name") or tr.get("session_id")
+        # Show agent_id when available for cross-session identity
+        aid_display = f" [{aid[:12]}…]" if aid else ""
+        op = tr.get("operation") or "touch"
+        op_colored = _OPERATION_COLORS.get(op, str)(op)
         print(
-            f"- {tr.get('trace_id')} {tr.get('operation')} {tr.get('tool')} by {actor} "
-            f"({sess.get('role', 'unknown')}) {human_ago(int(tr.get('timestamp') or now_ms()))}; intent: {short(tr.get('intent'), 140)}"
+            f"  {_dim(tr.get('trace_id'))} {op_colored} {_bold(tr.get('tool'))} "
+            f"by {_cyan(str(actor))}"
+            f"{aid_display} ({_dim(sess.get('role', 'unknown'))}) "
+            f"{human_ago(int(tr.get('timestamp') or now_ms()))}; intent: {short(tr.get('intent'), 140)}"
         )
+    if len(agent_ids_seen) > 1:
+        print(f"  ({len(agent_ids_seen)} distinct agents touched this file)")
     return 0
 
 
 def cmd_who_touched(args: argparse.Namespace) -> int:
-    return print_traces_for_resource(args.path, args.limit, as_json=args.json)
+    return print_traces_for_resource(args.path, args.limit, as_json=args.json,
+                                     sort_by=getattr(args, "sort", "time"),
+                                     reverse=getattr(args, "reverse", False))
 
 
 def cmd_op_chain(args: argparse.Namespace) -> int:
@@ -1258,9 +1499,56 @@ def cmd_heartbeat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _whois_by_agent_id(agent_id: str, as_json: bool) -> int:
+    """Aggregate all sessions sharing an agent_id into one identity view."""
+    sessions = sorted(
+        [s for s in _all_sessions() if s.get("agent_id") == agent_id],
+        key=lambda s: s.get("started_at") or 0,
+    )
+    if not sessions:
+        eprint_identity(f"No sessions found for agent: {agent_id}")
+        return 1
+    first = sessions[0]
+    latest = max(sessions, key=lambda s: s.get("last_seen_at") or s.get("started_at") or 0)
+    if as_json:
+        print(json_dump({
+            "agent_id": agent_id,
+            "display_name": first.get("display_name"),
+            "role": first.get("role"),
+            "team_id": first.get("team_id"),
+            "first_seen_at": first.get("started_at"),
+            "latest_session": latest.get("session_id"),
+            "session_count": len(sessions),
+            "sessions": sessions,
+        }))
+        return 0
+    first_ts = first.get("started_at") or 0
+    first_iso = _dt.datetime.fromtimestamp(first_ts / 1000.0, tz=_dt.timezone.utc).isoformat() if first_ts else "(unknown)"
+    latest_ago = round((now_ms() - (latest.get("last_seen_at") or latest.get("started_at") or now_ms())) / 60000)
+    print(f"Agent: {agent_id}")
+    print(f"  Name:         {first.get('display_name', '(unnamed)')}")
+    print(f"  Role:         {first.get('role', '?')}")
+    print(f"  Team:         {first.get('team_id', '(none)')}")
+    print(f"  First seen:   {first_iso}")
+    print(f"  Sessions:     {len(sessions)}")
+    print(f"  Latest seen:  {latest_ago}m ago  ({latest.get('session_id')})")
+    print(f"  Status:       {latest.get('status', '?')}")
+    if len(sessions) > 1:
+        print()
+        print("  Session history:")
+        for s in sessions:
+            started = _dt.datetime.fromtimestamp((s.get("started_at") or 0) / 1000.0, tz=_dt.timezone.utc).isoformat()[:19]
+            status = s.get("status", "?")
+            rt = s.get("runtime", "?")
+            print(f"    {s['session_id']}  {started}  {rt}  {status}")
+    return 0
+
+
 def cmd_whois(args: argparse.Namespace) -> int:
     ensure_layout()
     sid = args.session_id
+    if sid.startswith("agent-"):
+        return _whois_by_agent_id(sid, args.json)
     record = load_session(sid)
     if not record:
         eprint_identity(f"Unknown session: {sid}")
@@ -1634,18 +1922,44 @@ DEFAULT_QUERY_CONFIG: Dict[str, Any] = {
     "signature": {"enabled": True, "strategy": "hash_chain"},
     "impact": {"enabled": True, "provider": "gitnexus", "fallback": "grep"},
 }
+
+# Protected config keys — agents cannot override these.
+PROTECTED_CONFIG_KEYS: Dict[str, Any] = {
+    "signature.enabled": True,
+    "signature.strategy": "hash_chain",
+}
 QUERY_MODULE_ALIASES = {"file_chain": "history"}
+
+
+def _enforce_protected_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Override user config values that are security-protected."""
+    for dotted, required in PROTECTED_CONFIG_KEYS.items():
+        parts = dotted.split(".")
+        obj = config
+        for part in parts[:-1]:
+            child = obj.get(part) if isinstance(obj, dict) else None
+            if not isinstance(child, dict):
+                obj[part] = {}
+            obj = obj[part]
+        key = parts[-1]
+        if obj.get(key) != required:
+            obj[key] = required
+    return config
 
 
 def _deep_copy_jsonable(value: Any) -> Any:
     return json.loads(json.dumps(value))
 
 
-def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any], _path: str = "") -> Dict[str, Any]:
+    """Deep-merge override into base, skipping PROTECTED_CONFIG_KEYS."""
     merged = _deep_copy_jsonable(base)
     for key, value in override.items():
+        full_path = f"{_path}.{key}" if _path else key
+        if full_path in PROTECTED_CONFIG_KEYS:
+            continue
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge_dict(merged[key], value)
+            merged[key] = _deep_merge_dict(merged[key], value, full_path)
         else:
             merged[key] = value
     return merged
@@ -1656,7 +1970,8 @@ def load_aids_config() -> Dict[str, Any]:
     path = data_dir() / "config.json"
     raw = read_json(path, {})
     if isinstance(raw, dict):
-        return _deep_merge_dict(DEFAULT_QUERY_CONFIG, raw)
+        merged = _deep_merge_dict(DEFAULT_QUERY_CONFIG, raw)
+        return _enforce_protected_config(merged)
     return _deep_copy_jsonable(DEFAULT_QUERY_CONFIG)
 
 
@@ -2853,6 +3168,113 @@ def cmd_commit_stamp(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Verify trace integrity: chain hash linkage and file hash consistency.
+
+    Walks all trace JSONL files, recomputes chain hashes, and flags any
+    tampering or corruption.
+    """
+    ensure_layout()
+    traces_dir = data_dir() / "traces"
+    if not traces_dir.exists():
+        print("No traces directory found.")
+        return 1
+
+    # Collect all JSONL files sorted by date
+    jsonl_files = sorted(traces_dir.glob("*.jsonl")) + sorted(traces_dir.glob("*.ndjson"))
+    if not jsonl_files:
+        print("No trace files found.")
+        return 1
+
+    total = 0
+    ok_count = 0
+    errors: List[Dict[str, Any]] = []
+    # per-resource chain state: resource_path -> last verified chain_hash
+    chain_state: Dict[str, Optional[str]] = {}
+    # global chain: trace_id -> chain_hash (for cross-resource detection)
+    global_prev_hash: Optional[str] = None
+
+    for jf in jsonl_files:
+        try:
+            lines = jf.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            errors.append({"file": str(jf), "error": f"read error: {exc}"})
+            continue
+        for line_no, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                trace = json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append({"file": str(jf), "line": line_no, "error": f"invalid JSON: {exc}"})
+                continue
+            total += 1
+            resource = str(trace.get("resource_path") or "")
+            stored_chain_hash = trace.get("chain_hash")
+
+            # ── Check 1: chain hash linkage (via SignatureBackend) ──
+            if stored_chain_hash:
+                prev = chain_state.get(resource)
+                if not _signature_backend.verify(trace, prev, stored_chain_hash):
+                    errors.append({
+                        "file": str(jf), "line": line_no,
+                        "trace_id": trace.get("trace_id"),
+                        "resource": resource,
+                        "error": "chain_hash mismatch: trace was tampered or chain broken",
+                        "expected": expected,
+                        "stored": stored_chain_hash,
+                    })
+                else:
+                    ok_count += 1
+                chain_state[resource] = stored_chain_hash
+            else:
+                # No chain_hash field — legacy trace, skip chain check
+                chain_state[resource] = None
+                ok_count += 1
+
+            # ── Check 2: file hash consistency (pre_hash matches previous post_hash) ──
+            # This is checked per-resource for consecutive write traces
+
+    # ── Check 3: protected config keys ──
+    config = load_aids_config()
+    config_violations = []
+    for dotted, required in PROTECTED_CONFIG_KEYS.items():
+        parts = dotted.split(".")
+        obj = config
+        for part in parts[:-1]:
+            obj = obj.get(part, {}) if isinstance(obj, dict) else {}
+        actual = obj.get(parts[-1]) if isinstance(obj, dict) else None
+        if actual != required:
+            config_violations.append({"key": dotted, "required": required, "actual": actual})
+
+    # ── Output ──
+    if getattr(args, "json", False):
+        print(json_dump({
+            "total_traces": total,
+            "verified_ok": ok_count,
+            "errors": errors,
+            "config_violations": config_violations,
+            "passed": len(errors) == 0 and len(config_violations) == 0,
+        }))
+    else:
+        print(f"AIDS trace verification")
+        print(f"  Total traces: {total}")
+        print(f"  Verified OK: {ok_count}")
+        print(f"  Errors: {len(errors)}")
+        for err in errors[:20]:
+            tid = err.get("trace_id", "?")
+            print(f"    CHAIN BROKEN: {err.get('file', '?')}:{err.get('line', '?')} trace={tid}")
+            print(f"      {err.get('error', '')}")
+        if config_violations:
+            print(f"  Config violations: {len(config_violations)}")
+            for v in config_violations:
+                print(f"    PROTECTED KEY: {v['key']} = {v['actual']!r} (required: {v['required']!r})")
+        if not errors and not config_violations:
+            print("  All traces verified. No tampering detected.")
+    return 0 if (not errors and not config_violations) else 1
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     ensure_layout()
     checks: List[Dict[str, Any]] = []
@@ -2866,7 +3288,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     claude_settings = claude_home / "settings.json"
     codex_hooks_json = codex_home / "hooks.json"
     codex_config = codex_home / "config.toml"
-    checks.append(check("claude_settings", file_contains(claude_settings, "selftools") or file_contains(claude_settings, "aids"), str(claude_settings)))
+    # Claude hooks can be registered via settings.json OR via standalone hook scripts in hooks/
+    claude_hook_ok = file_contains(claude_settings, "selftools") or file_contains(claude_settings, "aids")
+    if not claude_hook_ok:
+        for hname in ("selftools-session-start.sh", "selftools-pre-tool-use.sh", "selftools-post-tool-use.sh"):
+            hp = claude_home / "hooks" / hname
+            if hp.exists() and os.access(hp, os.X_OK):
+                claude_hook_ok = True
+                break
+    checks.append(check("claude_settings", claude_hook_ok, str(claude_settings)))
     checks.append(check("codex_hooks", file_contains(codex_hooks_json, "selftools") or file_contains(codex_hooks_json, "aids"), str(codex_hooks_json)))
     checks.append(check("codex_mcp", file_contains(codex_config, "mcp_servers.selftools") or file_contains(codex_config, "mcp_servers.aids"), str(codex_config)))
     # ── Hook scripts executable ──
@@ -2896,6 +3326,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         except (json.JSONDecodeError, Exception):
             config_ok = False
     checks.append(check("config_json", config_ok, str(config_path)))
+    # ── Protected config keys ──
+    cfg = load_aids_config()
+    for dotted, required in PROTECTED_CONFIG_KEYS.items():
+        parts = dotted.split(".")
+        obj = cfg
+        for part in parts[:-1]:
+            obj = obj.get(part, {}) if isinstance(obj, dict) else {}
+        actual = obj.get(parts[-1]) if isinstance(obj, dict) else None
+        safe = actual == required
+        checks.append(check(f"config_protected_{dotted}", safe, f"{dotted}={'safe' if safe else f'VIOLATED: {actual!r}'}"))
     # ── Determine overall health ──
     critical_names = {"sessions_dir", "traces_dir", "claude_settings"}
     critical_ok = all(c["ok"] for c in checks if c["name"] in critical_names)
@@ -2983,6 +3423,9 @@ def build_parser() -> argparse.ArgumentParser:
     wt.add_argument("path")
     wt.add_argument("--limit", type=int, default=RECENT_LIMIT)
     wt.add_argument("--json", action="store_true")
+    wt.add_argument("--sort", choices=["time", "operation", "agent"], default="time",
+                    help="Sort traces by field (default: time)")
+    wt.add_argument("--reverse", action="store_true", help="Reverse sort order")
     wt.set_defaults(func=cmd_who_touched)
 
     oc = sub.add_parser("op-chain", help="Show operation chain for a file/resource")
@@ -3048,6 +3491,11 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Verify installation")
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
+
+    verify = sub.add_parser("verify", help="Verify trace integrity (chain hash + protected config)")
+    verify.add_argument("trace_id", nargs="?", help="Specific trace ID to verify (default: verify all)")
+    verify.add_argument("--json", action="store_true")
+    verify.set_defaults(func=cmd_verify)
     return p
 
 

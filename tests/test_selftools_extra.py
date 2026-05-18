@@ -392,5 +392,178 @@ class TestCmdRetireSession(TempDataMixin, unittest.TestCase):
         self.assertEqual(loaded["status"], "retired")
 
 
+class TestBashReadResources(unittest.TestCase):
+    """Tests for parse_bash_read_resources — Bash read-operation detection."""
+
+    def test_cat_detects_file(self):
+        result = selftools.parse_bash_read_resources("cat /tmp/readme.md", "/tmp")
+        self.assertTrue(any("readme.md" in r for r in result))
+
+    def test_grep_detects_file(self):
+        result = selftools.parse_bash_read_resources("grep pattern /tmp/app.py", "/tmp")
+        self.assertTrue(any("app.py" in r for r in result))
+
+    def test_head_detects_file(self):
+        result = selftools.parse_bash_read_resources("head -n 10 /tmp/log.txt", "/tmp")
+        self.assertTrue(any("log.txt" in r for r in result))
+
+    def test_tail_detects_file(self):
+        result = selftools.parse_bash_read_resources("tail -f /tmp/debug.log", "/tmp")
+        self.assertTrue(any("debug.log" in r for r in result))
+
+    def test_sed_detects_file(self):
+        result = selftools.parse_bash_read_resources("sed -n '1,5p' /tmp/data.txt", "/tmp")
+        self.assertTrue(any("data.txt" in r for r in result))
+
+    def test_awk_detects_file(self):
+        result = selftools.parse_bash_read_resources("awk '{print $1}' /tmp/data.csv", "/tmp")
+        self.assertTrue(any("data.csv" in r for r in result))
+
+    def test_pipeline_stops_at_pipe(self):
+        # cat reads the file; the pipe target is NOT a read target for wc
+        result = selftools.parse_bash_read_resources("cat /tmp/input.txt | wc -l", "/tmp")
+        self.assertTrue(any("input.txt" in r for r in result))
+        # wc runs after pipe — its args shouldn't appear
+        self.assertFalse(any("wc" in r for r in result))
+
+    def test_flags_skipped(self):
+        result = selftools.parse_bash_read_resources("grep -r -i pattern /tmp/src", "/tmp")
+        self.assertTrue(any("src" in r for r in result))
+
+    def test_dev_null_filtered(self):
+        result = selftools.parse_bash_read_resources("cat /dev/null", "/tmp")
+        self.assertEqual(len(result), 0)
+
+    def test_no_file_args(self):
+        result = selftools.parse_bash_read_resources("cat", "/tmp")
+        self.assertEqual(len(result), 0)
+
+    def test_non_path_args_skipped(self):
+        # bare words without / or . are not file paths
+        result = selftools.parse_bash_read_resources("grep pattern", "/tmp")
+        self.assertEqual(len(result), 0)
+
+    def test_detect_resources_integrates_reads(self):
+        resources = selftools.detect_resources("Bash", {"command": "cat /tmp/a.txt"}, "/tmp")
+        # Should contain bash:resource AND the read target
+        paths = [r for r in resources if not r.startswith("bash:")]
+        self.assertTrue(any("a.txt" in p for p in paths))
+
+    def test_diff_detects_files(self):
+        result = selftools.parse_bash_read_resources("diff /tmp/a.txt /tmp/b.txt", "/tmp")
+        self.assertEqual(len(result), 2)
+
+
+class TestWhoTouchedSort(TempDataMixin, unittest.TestCase):
+    """Tests for who-touched --sort and --reverse flags."""
+
+    def _seed_traces(self, resource):
+        """Seed two traces with different operations and agents."""
+        for i, (op, tool, name) in enumerate([
+            ("modify", "Edit", "Alice"),
+            ("read", "Read", "Bob"),
+            ("create", "Write", "Alice"),
+        ]):
+            session = {"session_id": f"s_sort{i}", "runtime": "claude", "role": "implementer",
+                       "display_name": name, "status": "active", "agent_id": f"aid_{name}"}
+            selftools.write_json_atomic(selftools.session_path(f"s_sort{i}"), session)
+            trace = {
+                "trace_id": f"tr_sort{i}", "session_id": f"s_sort{i}", "tool": tool,
+                "resource_path": resource, "operation": op, "intent": "test",
+                "timestamp": selftools.now_ms() + i * 1000, "timestamp_iso": selftools.iso_now(),
+                "runtime": "claude", "actor_type": "agent", "role": "implementer",
+                "agent_id": f"aid_{name}",
+            }
+            selftools.append_jsonl(selftools.traces_file_for_today(), trace)
+            selftools.update_index(resource, trace, session)
+
+    def test_sort_by_operation(self):
+        resource = str(Path("/tmp/sort_test.py").resolve())
+        self._seed_traces(resource)
+        args = selftools.build_parser().parse_args(["who-touched", resource, "--sort", "operation"])
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_who_touched(args)
+        self.assertEqual(rc, 0)
+        output = captured.getvalue()
+        # "create" comes before "modify" alphabetically, which comes before "read"
+        pos_create = output.find("create")
+        pos_modify = output.find("modify")
+        pos_read = output.find("read")
+        self.assertGreater(pos_create, -1)
+        self.assertGreater(pos_modify, -1)
+        self.assertGreater(pos_read, -1)
+        self.assertLess(pos_create, pos_modify)
+        self.assertLess(pos_modify, pos_read)
+
+    def test_sort_by_agent(self):
+        resource = str(Path("/tmp/sort_agent.py").resolve())
+        self._seed_traces(resource)
+        args = selftools.build_parser().parse_args(["who-touched", resource, "--sort", "agent"])
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_who_touched(args)
+        self.assertEqual(rc, 0)
+        output = captured.getvalue()
+        # Alice traces should appear before Bob traces
+        pos_alice = output.find("Alice")
+        pos_bob = output.find("Bob")
+        self.assertGreater(pos_alice, -1)
+        self.assertGreater(pos_bob, -1)
+        self.assertLess(pos_alice, pos_bob)
+
+    def test_reverse_flag(self):
+        resource = str(Path("/tmp/sort_rev.py").resolve())
+        self._seed_traces(resource)
+        args = selftools.build_parser().parse_args(["who-touched", resource, "--reverse"])
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_who_touched(args)
+        self.assertEqual(rc, 0)
+
+    def test_default_sort_is_time(self):
+        resource = str(Path("/tmp/sort_time.py").resolve())
+        self._seed_traces(resource)
+        args = selftools.build_parser().parse_args(["who-touched", resource])
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_who_touched(args)
+        self.assertEqual(rc, 0)
+
+
+class TestColorHelpers(unittest.TestCase):
+    """Tests for ANSI color helpers — NO_COLOR and non-tty behavior."""
+
+    def test_no_color_env_disables(self):
+        with patch.dict(os.environ, {"NO_COLOR": "1"}):
+            # Re-import the check by calling the helper directly
+            import importlib
+            # The module is exec'd; just test the function
+            original_no_color = selftools._NO_COLOR
+            selftools._NO_COLOR = True
+            result = selftools._color("36", "hello")
+            self.assertEqual(result, "hello")
+            selftools._NO_COLOR = original_no_color
+
+    def test_color_returns_plain_when_not_tty(self):
+        import io as _io
+        buf = _io.StringIO()
+        with patch("sys.stdout", buf):
+            # isatty() returns False for StringIO
+            result = selftools._color("36", "hello")
+            self.assertEqual(result, "hello")
+
+    def test_bold_and_dim(self):
+        # Just ensure they don't crash
+        selftools._NO_COLOR = False
+        with patch("sys.stdout.isatty", return_value=True):
+            b = selftools._bold("test")
+            d = selftools._dim("test")
+            # Should contain ANSI codes
+            self.assertIn("\033[", b)
+            self.assertIn("\033[", d)
+        selftools._NO_COLOR = True  # reset
+
+
 if __name__ == "__main__":
     unittest.main()
