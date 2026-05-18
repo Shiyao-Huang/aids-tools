@@ -81,7 +81,7 @@ The next person who opens this file can see if any previous operations have bad-
 
 ## Installation
 
-One command:
+### One-Line Install
 
 ```bash
 curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
@@ -89,13 +89,99 @@ curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install
 
 After installation, all three layers are covered: Claude Code, Codex, and Bash. All operations automatically go into the same timeline.
 
-Verify: `aids doctor` — all green means you're good:
+### Install from Source
+
+```bash
+git clone https://github.com/Shiyao-Huang/aids-tools.git
+cd aids-tools
+./install.sh --source .
+```
+
+### Verify Installation
+
+```bash
+aids doctor
+```
+
+All green means you're good:
 
 ```
 ✅ sessions_dir     ✅ traces_dir     ✅ timeline_dir
 ✅ index_dir        ✅ ratings_dir    ✅ pending_dir
-✅ claude_settings  ✅ codex_hooks    ✅ codex_mcp
-✅ symlink_aids     ✅ symlink_aids-run
+✅ locks_dir        ✅ config_json
+✅ claude_hooks     ✅ codex_hooks    ✅ codex_mcp
+✅ symlink_aids     ✅ symlink_aids-mcp  ✅ symlink_aids-run
+✅ lock_mechanism   ✅ stale_locks
+```
+
+### Install Options
+
+| Option | Description |
+|--------|-------------|
+| `--source DIR` | Install from a cloned directory, skip git clone |
+| `--repo URL` | Specify Git repository URL |
+| `--install-dir DIR` | Installation directory (default `~/.aids/selftools`) |
+| `--data-dir DIR` | Data directory (default `~/.aids`) |
+| `--bin-dir DIR` | Symlink directory (default `~/.local/bin`) |
+| `--no-claude` | Skip Claude Code hook registration |
+| `--no-codex` | Skip Codex hook registration |
+| `--no-mcp` | Skip MCP wrapper registration |
+| `--with-gitnexus` | Enable GitNexus code graph awareness |
+| `--dry-run` | Preview mode — print only, don't execute |
+
+### Environment Variables
+
+All install paths support environment variable overrides:
+
+```bash
+# Custom data directory
+AIDS_HOME=~/.my-aids curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
+
+# Install from a fork
+AIDS_REPO=https://github.com/you/aids-tools.git curl -sfL ... | bash
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AIDS_HOME` | `~/.aids` | Data root directory |
+| `AIDS_INSTALL_DIR` | `~/.aids/selftools` | Installation directory |
+| `AIDS_BIN_DIR` | `~/.local/bin` | Executable directory |
+| `AIDS_REPO` | `Shiyao-Huang/aids-tools` | Git repository |
+| `CLAUDE_HOME` | `~/.claude` | Claude Code config directory |
+| `CODEX_HOME` | `~/.codex` | Codex config directory |
+
+### Uninstall
+
+```bash
+# Keep data (default)
+./install.sh --uninstall
+
+# Full purge (including traces, sessions, ratings)
+./install.sh --uninstall --purge-data
+
+# Preview uninstall actions
+./install.sh --uninstall --dry-run
+```
+
+Uninstall removes `~/.local/bin/aids*` symlinks, Claude/Codex hooks, and MCP config. `--purge-data` also deletes `~/.aids/` data.
+
+### Post-Install Checklist
+
+```bash
+# 1. Check command is available
+which aids          # → ~/.local/bin/aids
+
+# 2. Run diagnostics
+aids doctor         # → all green
+
+# 3. Register current session
+aids register-session
+
+# 4. List all sessions
+aids list-sessions
+
+# 5. Try a query
+aids q README.md
 ```
 
 ---
