@@ -707,7 +707,7 @@ def detect_resources(tool_name: str, tool_input: Any, cwd: str) -> List[str]:
     if not isinstance(tool_input, dict):
         return resources
     # Claude file tools.
-    for key in ("file_path", "filePath", "path"):
+    for key in ("file_path", "filePath", "path", "notebook_path"):
         val = tool_input.get(key)
         if isinstance(val, str) and val and tool_name not in {"Bash"}:
             resources.append(normalize_resource(val, cwd))
@@ -1014,16 +1014,29 @@ def cmd_hook_pre_tool_use(_: argparse.Namespace) -> int:
         save_pending(event, session, resources)
     if tool_name in WRITE_TOOL_NAMES and resources:
         context = format_recent_context(resources, session)
-        # GitNexus code-graph awareness
-        gn_lines = []
+        # Built-in code-graph impact analysis (replaces external gitnexus)
+        impact_lines = []
         for res in resources:
-            if not res.startswith(("bash:", "mcp:")):
+            if res.startswith(("bash:", "mcp:")):
+                continue
+            bi = builtin_file_impact(res, cwd)
+            if bi and bi.get("found"):
+                dep_count = bi.get("dependent_count", 0)
+                impact_lines.append(f"- Code graph importance: {bi['importance']}")
+                if dep_count > 0:
+                    deps = bi.get("dependents", [])[:5]
+                    deps_display = ", ".join(os.path.basename(d) for d in deps)
+                    impact_lines.append(f"- Modifying this affects {dep_count} file(s): {deps_display}")
+                if bi.get("exports"):
+                    impact_lines.append(f"- Exports: {', '.join(bi['exports'][:8])}")
+            else:
+                # Fallback to external gitnexus if available
                 gn = gitnexus_file_context(res, cwd)
                 if gn and gn.get("available"):
-                    gn_lines.append(f"- GitNexus importance: {gn['importance']}")
-                    gn_lines.append(f"- GitNexus context: {short(gn['summary'], 300)}")
-        if gn_lines:
-            context += "\n" + "\n".join(gn_lines)
+                    impact_lines.append(f"- GitNexus importance: {gn['importance']}")
+                    impact_lines.append(f"- GitNexus context: {short(gn['summary'], 300)}")
+        if impact_lines:
+            context += "\n" + "\n".join(impact_lines)
         # Self-reference: show who is about to write
         who_am_i = f"{session.get('display_name') or session.get('session_id', '?')} ({session.get('role', '?')})"
         message = f"写前必读 / AIDS awareness for {tool_name}:\nYou are {who_am_i} about to write.\n{context}"
@@ -1096,16 +1109,24 @@ def tool_intent(event: Dict[str, Any]) -> str:
     return "unspecified"
 
 
+def _display_resource(res: str, max_len: int = 120) -> str:
+    """Truncate long bash: resources for display; leave file paths intact."""
+    if res.startswith("bash:") and len(res) > max_len:
+        return short(res, max_len)
+    return res
+
+
 def print_traces_for_resource(resource_arg: str, limit: int, *, as_json: bool = False) -> int:
     res = normalize_resource(resource_arg)
     traces = recent_traces(res, limit=limit)
     if as_json:
         print(json_dump({"resource_path": res, "traces": traces}))
         return 0
+    disp = _display_resource(res)
     if not traces:
-        print(f"No {ZH_NAME} traces for {res}")
+        print(f"No {ZH_NAME} traces for {disp}")
         return 1
-    print(f"{ZH_NAME} traces for {res}:")
+    print(f"{ZH_NAME} traces for {disp}:")
     for tr in traces:
         sess = tr.get("session") or {}
         actor = sess.get("display_name") or tr.get("session_id")
@@ -2250,6 +2271,16 @@ def _file_signature(path: Path) -> Optional[str]:
         return None
 
 
+def _is_python_shebang(fp: Path) -> bool:
+    """Check if a file starts with a Python shebang line."""
+    try:
+        with fp.open("r", encoding="utf-8", errors="replace") as f:
+            first = f.readline(128)
+        return first.startswith("#!") and "python" in first
+    except (OSError, PermissionError):
+        return False
+
+
 def _collect_source_files(root: Path) -> Dict[str, str]:
     """Walk root and return {relative_path: mtime:size} for all source files."""
     sigs: Dict[str, str] = {}
@@ -2260,9 +2291,17 @@ def _collect_source_files(root: Path) -> Dict[str, str]:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
         for fn in filenames:
-            if os.path.splitext(fn)[1].lower() not in src_exts:
-                continue
             fp = Path(dirpath) / fn
+            ext = os.path.splitext(fn)[1].lower()
+            if ext not in src_exts:
+                if ext == "" and _is_python_shebang(fp):
+                    pass  # extensionless Python script (e.g. bin/selftools)
+                else:
+                    continue
+            try:
+                rel = str(fp.relative_to(root))
+            except ValueError:
+                continue
             try:
                 rel = str(fp.relative_to(root))
             except ValueError:
@@ -2388,7 +2427,8 @@ def analyze_project(root: Path, *, force: bool = False) -> Dict[str, Any]:
         ext = os.path.splitext(rel)[1].lower()
         entry: Dict[str, Any] = {"imports": [], "exports": [], "resolved_deps": [], "imported_by": [], "refs": []}
 
-        if ext == ".py":
+        is_py = ext == ".py" or (ext == "" and source.startswith("#!") and "python" in source[:64])
+        if is_py:
             entry["imports"] = _parse_py_imports(source)
             entry["exports"] = _parse_py_exports(source)
         elif ext in {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}:
@@ -2499,7 +2539,7 @@ def builtin_file_impact(file_path: str, cwd: Optional[str] = None) -> Optional[D
             file_rel = file_path
 
         ext = os.path.splitext(file_rel)[1].lower()
-        if ext not in {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}:
+        if ext not in {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ""}:
             return None
 
         graph = analyze_project(root)
@@ -2608,29 +2648,55 @@ def cmd_impact(args: argparse.Namespace) -> int:
         eprint_identity(f"File not found: {file_path}")
         return 1
 
-    # Try GitNexus first
+    # ── Built-in CodeGraph analysis (AST + cached graph) ──
+    builtin = builtin_file_impact(file_path, cwd)
+
+    # ── External GitNexus (if installed) ──
     gn = gitnexus_file_context(file_path, cwd)
 
-    # Fallback: grep for dependents
-    dependents = _fallback_grep_dependents(file_path, cwd)
+    # ── Fallback: grep-based detection ──
+    grep_dependents = _fallback_grep_dependents(file_path, cwd)
+    grep_dependencies = _fallback_grep_imports(file_path, cwd)
 
-    # Fallback: git log
+    # ── Merge: prefer built-in, augment with fallbacks ──
+    if builtin and builtin.get("found"):
+        dependents = builtin["dependents"]
+        dependencies = builtin["dependencies"]
+        importance = builtin["importance"]
+        exports = builtin.get("exports", [])
+        # Augment with grep results not already found
+        for dep in grep_dependents:
+            if dep not in dependents:
+                dependents.append(dep)
+        for dep in grep_dependencies:
+            if dep not in dependencies:
+                dependencies.append(dep)
+    else:
+        dependents = grep_dependents
+        dependencies = grep_dependencies
+        exports = []
+        importance = "low"
+
+    # Git log
     git_entries = _fallback_git_log(file_path, cwd, count=5)
-
-    # Fallback: what this file imports
-    dependencies = _fallback_grep_imports(file_path, cwd)
 
     # AIDS traces for this file
     traces = recent_traces(file_path, limit=10)
 
-    # Importance heuristic
-    importance = _compute_importance(dependents, git_entries, traces)
-    if gn and gn.get("importance") in ("high", "medium", "low"):
-        importance = gn["importance"]
+    # Importance: upgrade if gitnexus or heuristic suggests higher
+    heuristic = _compute_importance(dependents, git_entries, traces)
+    for suggestion in [importance, heuristic, (gn.get("importance") if gn else None)]:
+        if suggestion == "high":
+            importance = "high"
+            break
+        if suggestion == "medium" and importance != "high":
+            importance = "medium"
 
     result: Dict[str, Any] = {
         "file": file_path,
         "importance": importance,
+        "exports": exports,
+        "builtin_graph": builtin,
         "gitnexus": gn,
         "dependents": dependents[:20],
         "dependencies": dependencies[:20],
@@ -2675,6 +2741,9 @@ def cmd_impact(args: argparse.Namespace) -> int:
         print(f"  GitNexus: {gn.get('summary', 'unavailable')}")
     else:
         print("  GitNexus: disabled or not installed")
+
+    if builtin and builtin.get("found"):
+        print(f"  Built-in code graph: {builtin.get('dependent_count', 0)} dependents, {len(builtin.get('exports', []))} exports")
     print()
 
     if dependents:
