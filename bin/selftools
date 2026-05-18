@@ -568,6 +568,8 @@ def register_session(event: Dict[str, Any], *, source: str = "hook") -> Dict[str
     )
     record.setdefault("started_at", ts)
     record.setdefault("started_iso", iso_now())
+    # Collision-safe: first_seen_at never changes once set
+    record.setdefault("first_seen_at", record.get("started_at", ts))
     write_json_atomic(path, record)
     return record
 

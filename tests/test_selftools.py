@@ -989,5 +989,87 @@ class TestIndexKeyDualLayer(unittest.TestCase):
         self.assertEqual(loaded.get("resource_path"), long_resource)
 
 
+class TestCmdRegisterSessionCLI(TempDataMixin, unittest.TestCase):
+    def test_register_via_cli(self):
+        import io
+        args = selftools.build_parser().parse_args([
+            "register-session", "--session-id", "cli-reg-1",
+            "--runtime", "claude", "--role", "tester",
+            "--goal", "test registration", "--display-name", "TestBot",
+        ])
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_register_session(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["session_id"], "cli-reg-1")
+        self.assertEqual(result["status"], "active")
+        loaded = selftools.load_session("cli-reg-1")
+        self.assertEqual(loaded["session_id"], "cli-reg-1")
+
+
+class TestCmdRateCLI(TempDataMixin, unittest.TestCase):
+    def _seed_trace(self, trace_id="tr_rate_cli"):
+        selftools.append_jsonl(selftools.traces_file_for_today(), {
+            "trace_id": trace_id,
+            "session_id": "s1",
+            "tool": "Write",
+            "resource_path": "/tmp/rate_cli.py",
+            "operation": "modify",
+            "intent": "test",
+            "timestamp": selftools.now_ms(),
+            "timestamp_iso": selftools.iso_now(),
+            "runtime": "claude",
+            "actor_type": "agent",
+        })
+
+    def test_rate_existing_trace(self):
+        import io
+        self._seed_trace()
+        args = selftools.build_parser().parse_args(["rate", "tr_rate_cli", "good", "nice work"])
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_rate(args)
+        self.assertEqual(rc, 0)
+        result = json.loads(captured.getvalue())
+        self.assertEqual(result["score"], "good")
+        self.assertEqual(result["comment"], "nice work")
+
+    def test_rate_nonexistent_trace(self):
+        import io
+        args = selftools.build_parser().parse_args(["rate", "tr_ghost", "bad", "missing"])
+        rc = selftools.cmd_rate(args)
+        self.assertEqual(rc, 1)
+
+    def test_duplicate_rating_rejected(self):
+        """INV-7: same rater cannot rate same trace twice."""
+        import io
+        self._seed_trace("tr_dup")
+        args1 = selftools.build_parser().parse_args(["rate", "tr_dup", "good", "first"])
+        captured1 = io.StringIO()
+        with patch("sys.stdout", captured1):
+            rc1 = selftools.cmd_rate(args1)
+        self.assertEqual(rc1, 0)
+
+        args2 = selftools.build_parser().parse_args(["rate", "tr_dup", "bad", "second"])
+        rc2 = selftools.cmd_rate(args2)
+        self.assertEqual(rc2, 1, "Duplicate rating should be rejected (INV-7)")
+
+    def test_different_rater_allowed(self):
+        """Different rater can rate the same trace."""
+        self._seed_trace("tr_multi")
+        # Rater 1
+        with patch.dict(os.environ, {"AIDS_SESSION_ID": "rater-1"}):
+            args1 = selftools.build_parser().parse_args(["rate", "tr_multi", "good", "from r1"])
+            rc1 = selftools.cmd_rate(args1)
+        self.assertEqual(rc1, 0)
+
+        # Rater 2
+        with patch.dict(os.environ, {"AIDS_SESSION_ID": "rater-2"}):
+            args2 = selftools.build_parser().parse_args(["rate", "tr_multi", "bad", "from r2"])
+            rc2 = selftools.cmd_rate(args2)
+        self.assertEqual(rc2, 0, "Different rater should be allowed")
+
+
 if __name__ == "__main__":
     unittest.main()
