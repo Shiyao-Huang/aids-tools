@@ -242,7 +242,6 @@ for spec in claude-impl-1 claude-impl-2 claude-impl-3 claude-impl-4 claude-qa; d
   log "  Spawning ${spec}..."
   npx aha agents spawn "$SPECS_DIR/${spec}.json" \
     --team "$TEAM_ID" \
-    --role "$(python3 -c "import json; print(json.load(open('$SPECS_DIR/${spec}.json'))['baseRoleId'])")" \
     --path "$PROJECT_DIR" \
     2>&1 | tail -1 || true
 done
@@ -253,7 +252,6 @@ for spec in codex-impl-1 codex-impl-2 codex-researcher codex-reviewer codex-qa; 
   log "  Spawning ${spec}..."
   npx aha agents spawn "$SPECS_DIR/${spec}.json" \
     --team "$TEAM_ID" \
-    --role "$(python3 -c "import json; print(json.load(open('$SPECS_DIR/${spec}.json'))['baseRoleId'])")" \
     --path "$PROJECT_DIR" \
     2>&1 | tail -1 || true
 done

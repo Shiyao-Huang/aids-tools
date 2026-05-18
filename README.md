@@ -81,7 +81,7 @@ Error: already rated by this session (INV-7 duplicate rejection)
 
 ## 安装
 
-一句话搞定：
+### 一键安装
 
 ```bash
 curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
@@ -89,13 +89,99 @@ curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install
 
 装完之后，Claude Code、Codex、Bash 三层全覆盖。所有操作自动进同一条 timeline。
 
-验证：`aids doctor` 全绿就 OK：
+### 从源码安装
+
+```bash
+git clone https://github.com/Shiyao-Huang/aids-tools.git
+cd aids-tools
+./install.sh --source .
+```
+
+### 验证安装
+
+```bash
+aids doctor
+```
+
+全绿就 OK：
 
 ```
 ✅ sessions_dir     ✅ traces_dir     ✅ timeline_dir
 ✅ index_dir        ✅ ratings_dir    ✅ pending_dir
-✅ claude_settings  ✅ codex_hooks    ✅ codex_mcp
-✅ symlink_aids     ✅ symlink_aids-run
+✅ locks_dir        ✅ config_json
+✅ claude_hooks     ✅ codex_hooks    ✅ codex_mcp
+✅ symlink_aids     ✅ symlink_aids-mcp  ✅ symlink_aids-run
+✅ lock_mechanism   ✅ stale_locks
+```
+
+### 安装选项
+
+| 选项 | 说明 |
+|------|------|
+| `--source DIR` | 从已克隆的目录安装，不 git clone |
+| `--repo URL` | 指定 Git 仓库地址 |
+| `--install-dir DIR` | 安装目录（默认 `~/.aids/selftools`） |
+| `--data-dir DIR` | 数据目录（默认 `~/.aids`） |
+| `--bin-dir DIR` | 符号链接目录（默认 `~/.local/bin`） |
+| `--no-claude` | 跳过 Claude Code hook 注册 |
+| `--no-codex` | 跳过 Codex hook 注册 |
+| `--no-mcp` | 跳过 MCP wrapper 注册 |
+| `--with-gitnexus` | 启用 GitNexus 代码图谱感知 |
+| `--dry-run` | 预览模式，只打印不执行 |
+
+### 环境变量
+
+所有安装路径都支持环境变量覆盖：
+
+```bash
+# 自定义数据目录
+AIDS_HOME=~/.my-aids curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install.sh | bash
+
+# 从 fork 安装
+AIDS_REPO=https://github.com/you/aids-tools.git curl -sfL ... | bash
+```
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `AIDS_HOME` | `~/.aids` | 数据根目录 |
+| `AIDS_INSTALL_DIR` | `~/.aids/selftools` | 安装目录 |
+| `AIDS_BIN_DIR` | `~/.local/bin` | 可执行文件目录 |
+| `AIDS_REPO` | `Shiyao-Huang/aids-tools` | Git 仓库 |
+| `CLAUDE_HOME` | `~/.claude` | Claude Code 配置目录 |
+| `CODEX_HOME` | `~/.codex` | Codex 配置目录 |
+
+### 卸载
+
+```bash
+# 保留数据（默认）
+./install.sh --uninstall
+
+# 完全清除（包括 traces、sessions、ratings）
+./install.sh --uninstall --purge-data
+
+# 预览卸载操作
+./install.sh --uninstall --dry-run
+```
+
+卸载内容：删除 `~/.local/bin/aids*` 符号链接、Claude/Codex hooks、MCP 配置。`--purge-data` 额外删除 `~/.aids/` 数据。
+
+### 安装后检查清单
+
+```bash
+# 1. 检查命令可用
+which aids          # → ~/.local/bin/aids
+
+# 2. 运行诊断
+aids doctor         # → 全绿
+
+# 3. 注册当前 session
+aids register-session
+
+# 4. 查看所有 session
+aids list-sessions
+
+# 5. 试一下查询
+aids q README.md
 ```
 
 ---
