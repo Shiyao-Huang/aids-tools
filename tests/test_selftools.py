@@ -145,6 +145,11 @@ class TestIndexKey(unittest.TestCase):
         k2 = selftools.index_key("/tmp/bar.py")
         self.assertNotEqual(k1, k2)
 
+    def test_long_resource_uses_short_hash_key(self):
+        key = selftools.index_key("bash:" + ("echo " * 200))
+        self.assertLess(len(key), 80)
+        self.assertTrue(key.startswith("sha256-"))
+
 
 class TestHumanAgo(unittest.TestCase):
     def test_seconds(self):
@@ -177,6 +182,19 @@ class TestToolIntent(unittest.TestCase):
         result = selftools.tool_intent({})
         self.assertEqual(result, "unspecified")
 
+
+class TestGitNexusIntegration(unittest.TestCase):
+    def test_run_gitnexus_unavailable_does_not_raise(self):
+        with patch.object(selftools.shutil, "which", return_value=None):
+            self.assertIsNone(selftools.run_gitnexus(["query", "anything"], "/tmp"))
+
+    def test_run_gitnexus_available_executes_command(self):
+        with patch.object(selftools.shutil, "which", return_value="/bin/echo"):
+            proc = selftools.run_gitnexus(["query", "anything"], "/tmp")
+
+        self.assertIsNotNone(proc)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("query anything", proc.stdout)
 
 
 # ─── Session management ───

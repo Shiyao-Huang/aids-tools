@@ -583,7 +583,11 @@ def normalize_resource(raw: str, cwd: Optional[str] = None) -> str:
 
 
 def index_key(resource: str) -> str:
-    return base64.urlsafe_b64encode(resource.encode("utf-8")).decode("ascii").rstrip("=")
+    encoded = base64.urlsafe_b64encode(resource.encode("utf-8")).decode("ascii").rstrip("=")
+    if len(encoded) <= 180:
+        return encoded
+    digest = hashlib.sha256(resource.encode("utf-8")).hexdigest()
+    return f"sha256-{digest}"
 
 
 def index_path(resource: str) -> Path:
@@ -713,6 +717,7 @@ def detect_resources(tool_name: str, tool_input: Any, cwd: str) -> List[str]:
     if tool_name == "Bash":
         cmd = short(tool_input.get("command") or "", 240)
         resources.append(f"bash:{cmd}")
+        resources.extend(parse_bash_write_resources(str(tool_input.get("command") or ""), cwd))
     if tool_name.startswith("mcp__"):
         resources.append(f"mcp:{tool_name}")
     # De-dupe while preserving order.
@@ -723,6 +728,55 @@ def detect_resources(tool_name: str, tool_input: Any, cwd: str) -> List[str]:
             seen.add(res)
             clean.append(res)
     return clean
+
+
+def parse_bash_write_resources(command: str, cwd: str) -> List[str]:
+    resources: List[str] = []
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = command.split()
+
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        target: Optional[str] = None
+        if token in {">", ">>"} and index + 1 < len(tokens):
+            target = tokens[index + 1]
+            index += 1
+        elif token.startswith(">>") and len(token) > 2:
+            target = token[2:]
+        elif token.startswith(">") and len(token) > 1:
+            target = token[1:]
+        elif token == "tee":
+            probe = index + 1
+            while probe < len(tokens) and tokens[probe].startswith("-"):
+                probe += 1
+            if probe < len(tokens):
+                target = tokens[probe]
+                index = probe
+        elif token in {"cp", "mv"}:
+            operands: List[str] = []
+            probe = index + 1
+            while probe < len(tokens) and tokens[probe] not in {";", "&&", "||", "|"}:
+                if not tokens[probe].startswith("-"):
+                    operands.append(tokens[probe])
+                probe += 1
+            if len(operands) >= 2:
+                target = operands[-1]
+                index = probe - 1
+
+        if target and not target.startswith(("-", "&")):
+            resources.append(normalize_resource(target, cwd))
+        index += 1
+
+    seen = set()
+    out = []
+    for res in resources:
+        if res not in seen:
+            seen.add(res)
+            out.append(res)
+    return out
 
 
 def parse_apply_patch_resources(command: str, cwd: str) -> List[str]:
@@ -752,7 +806,7 @@ def parse_apply_patch_resources(command: str, cwd: str) -> List[str]:
 def operation_for(tool_name: str, resource: str, pre_hash: Optional[str], post_hash: Optional[str]) -> str:
     if tool_name == "Read":
         return "read"
-    if tool_name == "Bash" or resource.startswith("bash:"):
+    if resource.startswith("bash:"):
         return "execute"
     if post_hash is None and pre_hash is not None:
         return "delete"

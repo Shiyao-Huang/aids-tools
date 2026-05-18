@@ -97,8 +97,10 @@ class AIDSTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = tempfile.mkdtemp(prefix="aids-test-")
         self.env = _env_for_test(self.test_dir)
-        self.test_file = Path(self.test_dir) / "test_resource.py"
+        # Use resolve() to match CLI's normalize_resource (macOS /var → /private/var)
+        self.test_file = (Path(self.test_dir) / "test_resource.py").resolve()
         self.test_file.write_text("# original content\n", encoding="utf-8")
+        self.resolved_dir = str(Path(self.test_dir).resolve())
         self.session_id = f"test-sess-{uuid.uuid4().hex[:8]}"
         self.env["AIDS_SESSION_ID"] = self.session_id
         self.env["AIDS_ROLE"] = "implementer"
@@ -136,31 +138,34 @@ class AIDSTestBase(unittest.TestCase):
     def _simulate_session_start(self) -> None:
         event = {
             "session_id": self.session_id,
-            "cwd": self.test_dir,
+            "cwd": self.resolved_dir,
             "hook_event_name": "SessionStart",
         }
         _run_hook("session-start", event, env=self.env)
 
-    def _simulate_pre_tool_use(self, tool_name: str, file_path: str) -> None:
+    def _simulate_pre_tool_use(self, tool_name: str, file_path: str, tool_use_id: Optional[str] = None) -> str:
+        """运行 PreToolUse hook。返回 tool_use_id。"""
+        tid = tool_use_id or f"tu-{uuid.uuid4().hex[:8]}"
         event = {
             "tool_name": tool_name,
             "tool_input": {"file_path": file_path},
-            "cwd": self.test_dir,
-            "tool_use_id": f"tu-{uuid.uuid4().hex[:8]}",
+            "cwd": self.resolved_dir,
+            "tool_use_id": tid,
             "session_id": self.session_id,
             "hook_event_name": "PreToolUse",
         }
         _run_hook("pre-tool-use", event, env=self.env)
+        return tid
 
     def _simulate_post_tool_use(
-        self, tool_name: str, file_path: str, tool_use_id: Optional[str] = None
+        self, tool_name: str, file_path: str, tool_use_id: str,
     ) -> None:
         event = {
             "tool_name": tool_name,
             "tool_input": {"file_path": file_path},
             "tool_response": "ok",
-            "cwd": self.test_dir,
-            "tool_use_id": tool_use_id or f"tu-{uuid.uuid4().hex[:8]}",
+            "cwd": self.resolved_dir,
+            "tool_use_id": tool_use_id,
             "session_id": self.session_id,
             "hook_event_name": "PostToolUse",
         }
@@ -169,18 +174,18 @@ class AIDSTestBase(unittest.TestCase):
     def _simulate_write_flow(self, file_path: str, new_content: str) -> str:
         """模拟完整写操作流程：Pre → 实际写入 → Post。返回 tool_use_id。"""
         tool_use_id = f"tu-{uuid.uuid4().hex[:8]}"
-        # Pre
-        self._simulate_pre_tool_use("Edit", file_path)
+        # Pre — 必须用同一个 tool_use_id
+        self._simulate_pre_tool_use("Edit", file_path, tool_use_id=tool_use_id)
         # 实际写入
         Path(file_path).write_text(new_content, encoding="utf-8")
-        # Post
+        # Post — 用同一个 tool_use_id 匹配 pending
         self._simulate_post_tool_use("Edit", file_path, tool_use_id=tool_use_id)
         return tool_use_id
 
     def _simulate_read_flow(self, file_path: str) -> None:
         """模拟读操作流程。"""
-        self._simulate_pre_tool_use("Read", file_path)
-        self._simulate_post_tool_use("Read", file_path)
+        tid = self._simulate_pre_tool_use("Read", file_path)
+        self._simulate_post_tool_use("Read", file_path, tool_use_id=tid)
 
 
 # ============================================================
@@ -428,7 +433,7 @@ class TestINV7_GoodhartProtection(AIDSTestBase):
     def test_rate_requires_valid_trace(self) -> None:
         """对不存在的 trace 评分应失败。"""
         self._simulate_session_start()
-        result = _run_cli("rate", "tr_nonexistent123", "good", "--comment", "test", env=self.env)
+        result = _run_cli("rate", "tr_nonexistent123", "good", "test", env=self.env)
         self.assertNotEqual(result.returncode, 0, "INV-7: rate should fail for nonexistent trace")
 
     def test_rate_records_rater_identity(self) -> None:
@@ -441,7 +446,7 @@ class TestINV7_GoodhartProtection(AIDSTestBase):
         trace_id = traces[0]["trace_id"]
 
         # 评分
-        result = _run_cli("rate", trace_id, "good", "--comment", "test rating", env=self.env)
+        result = _run_cli("rate", trace_id, "good", "test", "rating", env=self.env)
         self.assertEqual(result.returncode, 0, f"Rate should succeed: {result.stderr}")
 
         ratings = self._ratings_today()
@@ -462,7 +467,7 @@ class TestINV7_GoodhartProtection(AIDSTestBase):
         traces = self._traces_today()
         trace_id = traces[0]["trace_id"]
 
-        _run_cli("rate", trace_id, "bad", "--comment", "poor quality", env=self.env)
+        _run_cli("rate", trace_id, "bad", "poor", "quality", env=self.env)
 
         ratings = self._ratings_today()
         self.assertGreater(len(ratings), 0)
