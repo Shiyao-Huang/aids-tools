@@ -524,6 +524,12 @@ def load_session(session_id: str) -> Dict[str, Any]:
     return read_json(session_path(session_id), {}) or {}
 
 
+def compute_agent_id(display_name: str, role: str, team_id: Optional[str] = None) -> str:
+    """Stable agent identity across sessions. Same name + role + team = same agent_id."""
+    seed = f"{display_name or ''}\0{role or ''}\0{team_id or ''}"
+    return "agent-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
 def register_session(event: Dict[str, Any], *, source: str = "hook") -> Dict[str, Any]:
     ensure_layout()
     sid = session_id_from(event)
@@ -555,6 +561,10 @@ def register_session(event: Dict[str, Any], *, source: str = "hook") -> Dict[str
             "last_seen_at": ts,
             "last_seen_iso": iso_now(),
         }
+    )
+    # Stable agent_id: persists across session restarts for the same agent identity.
+    record["agent_id"] = old.get("agent_id") or compute_agent_id(
+        record.get("display_name", ""), record.get("role", ""), record.get("team_id")
     )
     record.setdefault("started_at", ts)
     record.setdefault("started_iso", iso_now())
@@ -613,6 +623,7 @@ def update_index(resource: str, trace: Dict[str, Any], session: Dict[str, Any]) 
                 "trace_ids": trace_ids,
                 "last_op": trace.get("operation"),
                 "last_actor": trace.get("session_id"),
+                "last_agent_id": trace.get("agent_id") or session.get("agent_id"),
                 "last_actor_role": session.get("role"),
                 "last_actor_type": trace.get("actor_type") or session.get("actor_type"),
                 "last_runtime": trace.get("runtime") or session.get("runtime"),
@@ -653,6 +664,7 @@ def timeline_event_from_trace(trace: Dict[str, Any], event: Dict[str, Any], sess
         "actor_type": trace.get("actor_type") or session.get("actor_type") or "unknown",
         "runtime": trace.get("runtime") or session.get("runtime") or "unknown",
         "session_id": trace.get("session_id") or "unknown",
+        "agent_id": trace.get("agent_id") or session.get("agent_id"),
         "role": session.get("role"),
         "tool": trace.get("tool") or "unknown",
         "resource": trace.get("resource_path") or "unknown",
@@ -1076,6 +1088,7 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
         trace = {
             "trace_id": new_id("tr"),
             "session_id": session.get("session_id"),
+            "agent_id": session.get("agent_id"),
             "tool": tool_name or "unknown",
             "resource_path": res,
             "operation": operation_for(tool_name, res, pre_hash, post_hash),
@@ -1163,6 +1176,7 @@ def cmd_session_info(args: argparse.Namespace) -> int:
         print(json_dump(record))
     else:
         print(f"session_id: {record.get('session_id')}")
+        print(f"agent_id:   {record.get('agent_id')}")
         print(f"runtime:    {record.get('runtime')}")
         print(f"role:       {record.get('role')}")
         print(f"display:    {record.get('display_name')}")
@@ -1256,6 +1270,7 @@ def cmd_whois(args: argparse.Namespace) -> int:
     last = record.get("last_seen_at") or record.get("started_at") or now_ms()
     ago = round((now_ms() - last) / 60000)
     print(f"Session: {record.get('session_id')}")
+    print(f"  Agent ID:     {record.get('agent_id', '(none)')}")
     print(f"  Role:         {record.get('role', '?')}")
     print(f"  Name:         {record.get('display_name', '(unnamed)')}")
     print(f"  Runtime:      {record.get('runtime', '?')}{('/' + record['model']) if record.get('model') else ''}")
@@ -1300,6 +1315,20 @@ def cmd_rate(args: argparse.Namespace) -> int:
         eprint_identity(f"Trace not found: {args.trace_id}")
         return 1
     rater = env_first("AIDS_SESSION_ID", "AID_SESSION_ID", "SESSION_ID", "SELFTOOLS_SESSION_ID", "ZHUYI_SESSION_ID") or "anonymous"
+    # INV-7: reject duplicate (trace_id, rater_session_id) ratings
+    ratings_dir = data_dir() / "ratings"
+    if ratings_dir.exists():
+        for rf in sorted(ratings_dir.glob("*.jsonl")):
+            for line in rf.read_text().strip().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    existing = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if existing.get("trace_id") == args.trace_id and existing.get("rater_session_id") == rater:
+                    eprint_identity(f"Already rated by {rater}: {args.trace_id}")
+                    return 1
     rating = {
         "rating_id": new_id("rt"),
         "trace_id": args.trace_id,
@@ -1728,6 +1757,7 @@ def _compact_trace(trace: Dict[str, Any], intent_max: int = 80) -> Dict[str, Any
         "operation": trace.get("operation"),
         "tool": trace.get("tool"),
         "session_id": trace.get("session_id") or trace.get("sessionId"),
+        "agent_id": trace.get("agent_id"),
         "role": trace.get("role"),
         "runtime": trace.get("runtime"),
         "resource_path": trace.get("resource_path") or trace.get("filePath"),
@@ -1743,6 +1773,10 @@ def detect_query_target(query: str) -> Dict[str, Any]:
             return {"kind": "trace", "query": query, "id": tok, "record": read_trace(tok)}
         if tok.startswith("rt_"):
             return {"kind": "rating", "query": query, "id": tok, "record": read_rating(tok)}
+        if tok.startswith("agent-"):
+            sessions = [s for s in _all_sessions() if s.get("agent_id") == tok]
+            if sessions:
+                return {"kind": "agent", "query": query, "id": tok, "sessions": sessions}
 
     for tok in tokens:
         session = load_session(tok)
@@ -1762,7 +1796,7 @@ def _fuzzy_sessions(query: str, limit: int) -> List[Dict[str, Any]]:
     needle = query.lower()
     matches = []
     for session in _all_sessions():
-        hay = " ".join(str(session.get(k) or "") for k in ("session_id", "display_name", "role", "goal", "task_id")).lower()
+        hay = " ".join(str(session.get(k) or "") for k in ("session_id", "display_name", "role", "goal", "task_id", "agent_id")).lower()
         if needle and needle in hay:
             matches.append(session)
     return matches[:limit]
@@ -1798,6 +1832,8 @@ def resolve_identity(target: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, A
         if traces:
             sid = str(traces[-1].get("session_id") or "")
             sessions.append(load_session(sid) or {"session_id": sid})
+    elif target["kind"] == "agent":
+        sessions.extend(target.get("sessions") or [])
     elif target["kind"] == "unknown":
         sessions.extend(_fuzzy_sessions(str(target.get("query") or ""), limit))
 
@@ -1827,6 +1863,13 @@ def resolve_history(target: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, An
         traces = [trace] if trace else []
     elif target["kind"] == "session":
         traces = session_traces(str(target.get("id") or ""), limit)
+    elif target["kind"] == "agent":
+        agent_sessions = target.get("sessions") or []
+        sids = [str(s.get("session_id") or "") for s in agent_sessions]
+        all_traces: List[Dict[str, Any]] = []
+        for sid in sids:
+            all_traces.extend(session_traces(sid, limit))
+        traces = all_traces[:limit]
     else:
         traces = _fuzzy_traces(str(target.get("query") or ""), limit)
 
