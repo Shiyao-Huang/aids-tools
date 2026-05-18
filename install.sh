@@ -315,8 +315,8 @@ def add(event, matcher, script, status):
     })
 
 add("SessionStart", "startup|resume|clear|compact", "selftools-session-start.sh", "Registering AIDS session")
-add("PreToolUse", "Read|Edit|Write|MultiEdit|Bash", "selftools-pre-tool-use.sh", "Checking AIDS trace chain")
-add("PostToolUse", "Read|Edit|Write|MultiEdit|Bash", "selftools-post-tool-use.sh", "Recording AIDS trace")
+add("PreToolUse", "Read|Edit|Write|MultiEdit|Bash|NotebookEdit", "selftools-pre-tool-use.sh", "Checking AIDS trace chain")
+add("PostToolUse", "Read|Edit|Write|MultiEdit|Bash|NotebookEdit", "selftools-post-tool-use.sh", "Recording AIDS trace")
 settings.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
   ok "Claude Code hooks registered"
@@ -375,8 +375,8 @@ def add(event, matcher, script, status):
 
 add("SessionStart", "startup|resume|clear", "selftools-session-start.sh", "Registering AIDS session")
 # Codex maps apply_patch to Edit/Write aliases, but keeping apply_patch explicit helps old builds.
-add("PreToolUse", "Bash|apply_patch|Edit|Write|mcp__.*", "selftools-pre-tool-use.sh", "Checking AIDS trace chain")
-add("PostToolUse", "Bash|apply_patch|Edit|Write|mcp__.*", "selftools-post-tool-use.sh", "Recording AIDS trace")
+add("PreToolUse", "Bash|apply_patch|Edit|Write|Read|NotebookEdit|mcp__.*", "selftools-pre-tool-use.sh", "Checking AIDS trace chain")
+add("PostToolUse", "Bash|apply_patch|Edit|Write|Read|NotebookEdit|mcp__.*", "selftools-post-tool-use.sh", "Recording AIDS trace")
 hooks_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
   ok "Codex hooks registered"

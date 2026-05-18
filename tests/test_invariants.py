@@ -502,7 +502,7 @@ class TestIntegration_FullHookFlow(AIDSTestBase):
         traces = self._traces_today()
         if traces:
             trace_id = traces[0]["trace_id"]
-            _run_cli("rate", trace_id, "good", "--comment", "integration test", env=self.env)
+            _run_cli("rate", trace_id, "good", "integration", "test", env=self.env)
 
         # ── 验证所有不变量 ──
 
