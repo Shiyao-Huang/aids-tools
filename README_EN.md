@@ -47,11 +47,12 @@ Everyone can look up this badge: `aids who-touched config.json`
 
 Every time someone modifies a file, AIDS automatically records:
 
-```
-📝 config.json
-  ← claude-impl-01 · implementer · "Fix login bug" · 2 minutes ago
-  ← codex-architect · architect · "Adjust database config" · 15 minutes ago
-  ← bash-human-001 · developer · "Manually changed port number" · 1 hour ago
+```bash
+$ aids who-touched config.json
+AIDS (Agent-ID System) traces for config.json:
+- tr_9c60b2582ac1 read Read by Claude Implementer (implementer) 2min ago; intent: Fix login bug
+- tr_ff77921e50b3 modify Modify by Codex Architect (architect) 15min ago; intent: Adjust database config
+- tr_10037a3d9745 modify Modify by bash-human-001 (developer) 1h ago; intent: Manually changed port number
 ```
 
 Before writing, AIDS **gives you a heads-up** if someone recently touched the file (read-before-write guard):
@@ -62,10 +63,14 @@ Before writing, AIDS **gives you a heads-up** if someone recently touched the fi
 
 ### 3. ⭐ Rating Tag (Rating)
 
-Someone did good? Give a good review. Someone caused damage? Give a bad review.
+Someone did good? Give a good review. Someone caused damage? Give a bad review. **But the same person can't rate the same trace twice (INV-7 anti-gaming protection).**
 
 ```bash
-aids rate trace_003 bad "Shouldn't use a test password in production config"
+$ aids rate tr_ff77921e50b3 bad "Shouldn't use a test password in production config"
+Rated tr_ff77921e50b3 as bad: Shouldn't use a test password in production config
+
+$ aids rate tr_ff77921e50b3 bad "Rating again"
+Error: already rated by this session (INV-7 duplicate rejection)
 ```
 
 The next person who opens this file can see if any previous operations have bad-review warnings.
@@ -84,7 +89,14 @@ curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install
 
 After installation, all three layers are covered: Claude Code, Codex, and Bash. All operations automatically go into the same timeline.
 
-Verify: `aids doctor` — all green means you're good.
+Verify: `aids doctor` — all green means you're good:
+
+```
+✅ sessions_dir     ✅ traces_dir     ✅ timeline_dir
+✅ index_dir        ✅ ratings_dir    ✅ pending_dir
+✅ claude_settings  ✅ codex_hooks    ✅ codex_mcp
+✅ symlink_aids     ✅ symlink_aids-run
+```
 
 ---
 
@@ -108,10 +120,10 @@ $ aids-run -- vim README.md
 # This command is also recorded in the timeline
 
 $ aids who-touched README.md
-📝 README.md
-  ← bash-human-001 · developer · "Fixed a typo" · just now
-  ← claude-scribe · scribe · "Wrote the kid-friendly README" · 5 minutes ago
-  ← codex-impl-01 · implementer · "Added a banner" · 1 hour ago
+AIDS (Agent-ID System) traces for README.md:
+- tr_a1b2c3d4e5f6 modify Modify by bash-human-001 (developer) just now; intent: Fixed a typo
+- tr_b2c3d4e5f6a7 modify Modify by Claude Scribe (scribe) 5min ago; intent: Wrote the kid-friendly README
+- tr_c3d4e5f6a7b8 modify Modify by Codex impl-01 (implementer) 1h ago; intent: Added a banner
 ```
 
 **Humans are workers too. Name tags treat everyone equally.**
@@ -119,7 +131,7 @@ $ aids who-touched README.md
 ### 🎬 Scenario 3: K's Bad Review
 
 ```bash
-$ aids rate trace_042 bad "Running rm -rf /tmp/important directly is too dangerous"
+$ aids rate tr_042a1b2c3d4 bad "Running rm -rf /tmp/important directly is too dangerous"
 
 # When the next person comes along
 [claude-impl-02] About to write /tmp/important/config.yaml →
@@ -133,12 +145,73 @@ $ aids rate trace_042 bad "Running rm -rf /tmp/important directly is too dangero
 
 ```bash
 $ aids timeline README.md
-Claude(scribe) → Codex(impl) → Bash(human) → Claude(architect) → Codex(impl)
+14:22:31 agent/claude Claude Scribe    Read     README.md
+14:20:15 agent/codex  Codex impl-01    Write    README.md
+13:45:02 agent/bash   bash-human-001   Modify   README.md
+13:30:00 agent/claude Claude Architect Read     README.md
+13:10:00 agent/codex  Codex impl-01    Write    README.md
 
 # Like a security camera replay — when each worker came by and what they did, all at a glance
 ```
 
 **This isn't traceability. Traceability is just a side effect. What's really happening: every worker has gained awareness. They know who's around, what they did, and what they should or shouldn't touch.**
+
+---
+
+## Latest Features
+
+### 🆔 Stable Identity (agent_id)
+
+Every agent automatically gets an `agent_id` on registration — a deterministic hash of display_name + role + team_id. Even if the session restarts, the identity stays the same:
+
+```bash
+$ aids whois "Claude Implementer"
+Session:  cmpak5mg7pnwls2232jfzn2sb
+Name:     Claude Implementer
+Role:     implementer
+Agent ID: agent-7f3a9c2e1d  ← stable across sessions
+Status:   active
+```
+
+**Ming picks up a badge today. He gets a new badge tomorrow. But the badge number is always the same.**
+
+### 🛡️ Anti-Gaming (INV-7)
+
+The same session can't rate the same trace twice. Prevents Little K from gaming his own bad reviews.
+
+```bash
+$ aids rate tr_abc123 good "I think it's fine"
+Rated tr_abc123 as good
+$ aids rate tr_abc123 good "Really good"
+Error: already rated by this session (INV-7 duplicate rejection)
+```
+
+**But different people can rate the same operation — Hong's review is Hong's, Ming's is Ming's.**
+
+### 📊 Stats Dashboard (stats)
+
+One command to see the big picture:
+
+```bash
+$ aids stats
+AIDS Statistics (2026-05-12 → 2026-05-18)
+
+Sessions: 108 total (active: 108)
+  By runtime: bash: 8, claude: 91, codex: 8, unknown: 1
+Traces:   1509 total (Write: 1, create: 20, execute: 989, modify: 113, read: 345, touch: 41)
+Resources touched: 983 unique
+Ratings: 3 total (good: 3)
+```
+
+### 🔍 Universal Query (q)
+
+Don't memorize commands — just ask:
+
+```bash
+$ aids q README.md              # Full story of a file
+$ aids q tr_abc123              # Look up a specific trace
+$ aids q agent-7f3a9c2e1d       # Query by agent_id
+```
 
 ---
 
@@ -148,7 +221,9 @@ AIDS is built on three core components:
 
 1. **Hook**: Injects "check if anyone recently modified this" logic before and after every operation in Claude Code / Codex / Bash
 2. **Timeline**: All operations are written to `~/.aids/timeline/*.jsonl`, a unified operation chain
-3. **Rating**: Anyone can rate operations as good or bad, and newcomers can see those ratings
+3. **Rating**: Anyone can rate operations as good or bad, and newcomers can see those ratings (no duplicate ratings per session)
+
+Full command list: `aids {doctor, who-touched, timeline, rate, stats, q, op-chain, impact, export, commit-stamp}`
 
 Zero dependencies. JSONL files. Non-blocking. Works automatically after installation.
 
@@ -177,3 +252,12 @@ This isn't traceability. This is awareness.
 ---
 
 *Built with [Claude Code](https://claude.ai/code) via [Aha](https://aha.engineering)*
+
+## Cross-Pollination with AID
+
+AIDS borrows two default strategies from AID:
+
+- **Context budget**: Hooks inject short context by default — more recent entries first, prioritizing risk and signal-to-noise ratio; configurable via `AIDS_AWARENESS_LINES` / `AIDS_AWARENESS_CHARS`.
+- **All important tools leave traces**: Not just `Read/Write/Edit/Bash` — `WebFetch`, `WebSearch`, `apply_patch`, agent tools, and planning tools also enter the same timeline; tools without file resources use `tool:<name>` resource keys.
+
+AID in turn borrows the ToolEnvelope concept from AIDS/selftools, wrapping each hook event into a portable tool envelope for future integration with JSONL timeline, rating, MCP, or other runtimes.

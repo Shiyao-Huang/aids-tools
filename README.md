@@ -47,11 +47,12 @@ AIDS_INTENT="修复登录 bug"
 
 每次有人改文件，AIDS 自动记录：
 
-```
-📝 config.json
-  ← claude-impl-01 · implementer · "修复登录 bug" · 2分钟前
-  ← codex-architect · architect · "调整数据库配置" · 15分钟前
-  ← bash-human-001 · developer · "手动改了端口号" · 1小时前
+```bash
+$ aids who-touched config.json
+AIDS (Agent-ID System) traces for config.json:
+- tr_9c60b2582ac1 read Read by Claude Implementer (implementer) 2min ago; intent: 修复登录 bug
+- tr_ff77921e50b3 modify Modify by Codex Architect (architect) 15min ago; intent: 调整数据库配置
+- tr_10037a3d9745 modify Modify by bash-human-001 (developer) 1h ago; intent: 手动改了端口号
 ```
 
 写之前，AIDS 会**先给你看一眼**有没有人刚动过这个文件（写前必读 / 写前读毒）：
@@ -62,10 +63,14 @@ AIDS_INTENT="修复登录 bug"
 
 ### 3. ⭐ 评价贴（Rating）
 
-有人干得好？贴好评。有人搞破坏？贴差评。
+有人干得好？贴好评。有人搞破坏？贴差评。**但同一个人不能给同一个操作重复打分（INV-7 防刷分保护）。**
 
 ```bash
-aids rate trace_003 bad "不该在生产配置里用 test 密码"
+$ aids rate tr_ff77921e50b3 bad "不该在生产配置里用 test 密码"
+Rated tr_ff77921e50b3 as bad: 不该在生产配置里用 test 密码
+
+$ aids rate tr_ff77921e50b3 bad "再打一次"
+Error: already rated by this session (INV-7 duplicate rejection)
 ```
 
 下一个人打开这个文件的时候，能看到之前的操作里有没有差评警告。
@@ -84,7 +89,14 @@ curl -sfL https://raw.githubusercontent.com/Shiyao-Huang/aids-tools/main/install
 
 装完之后，Claude Code、Codex、Bash 三层全覆盖。所有操作自动进同一条 timeline。
 
-验证：`aids doctor` 全绿就 OK。
+验证：`aids doctor` 全绿就 OK：
+
+```
+✅ sessions_dir     ✅ traces_dir     ✅ timeline_dir
+✅ index_dir        ✅ ratings_dir    ✅ pending_dir
+✅ claude_settings  ✅ codex_hooks    ✅ codex_mcp
+✅ symlink_aids     ✅ symlink_aids-run
+```
 
 ---
 
@@ -108,10 +120,10 @@ $ aids-run -- vim README.md
 # 这条命令也被记进了 timeline
 
 $ aids who-touched README.md
-📝 README.md
-  ← bash-human-001 · developer · "修了个 typo" · 刚刚
-  ← claude-scribe · scribe · "写小孩版 README" · 5分钟前
-  ← codex-impl-01 · implementer · "加了个 banner" · 1小时前
+AIDS (Agent-ID System) traces for README.md:
+- tr_a1b2c3d4e5f6 modify Modify by bash-human-001 (developer) just now; intent: 修了个 typo
+- tr_b2c3d4e5f6a7 modify Modify by Claude Scribe (scribe) 5min ago; intent: 写小孩版 README
+- tr_c3d4e5f6a7b8 modify Modify by Codex impl-01 (implementer) 1h ago; intent: 加了个 banner
 ```
 
 **人类也是小工之一，名字贴对所有人一视同仁。**
@@ -119,7 +131,7 @@ $ aids who-touched README.md
 ### 🎬 场景三：K 的敌敌畏被差评
 
 ```bash
-$ aids rate trace_042 bad "直接 rm -rf /tmp/important 太危险了"
+$ aids rate tr_042a1b2c3d4 bad "直接 rm -rf /tmp/important 太危险了"
 
 # 下一个人来的时候
 [claude-impl-02] 准备写 /tmp/important/config.yaml →
@@ -133,12 +145,73 @@ $ aids rate trace_042 bad "直接 rm -rf /tmp/important 太危险了"
 
 ```bash
 $ aids timeline README.md
-Claude(scribe) → Codex(impl) → Bash(human) → Claude(architect) → Codex(impl)
+14:22:31 agent/claude Claude Scribe    Read     README.md
+14:20:15 agent/codex  Codex impl-01    Write    README.md
+13:45:02 agent/bash   bash-human-001   Modify   README.md
+13:30:00 agent/claude Claude Architect Read     README.md
+13:10:00 agent/codex  Codex impl-01    Write    README.md
 
 # 像监控摄像头回放一样，每个小工什么时候来过，干了什么，一目了然
 ```
 
 **这不是追溯。追溯只是副产品。真正发生的是：每个小工长脑子了。它知道周围有谁，谁干了什么，什么该碰什么不该碰。**
+
+---
+
+## 最新功能
+
+### 🆔 稳定身份（agent_id）
+
+每个 agent 注册时自动生成一个 `agent_id`——基于 display_name + role + team_id 的确定性哈希。即使 session 重启了，身份也不变：
+
+```bash
+$ aids whois "Claude Implementer"
+Session:  cmpak5mg7pnwls2232jfzn2sb
+Name:     Claude Implementer
+Role:     implementer
+Agent ID: agent-7f3a9c2e1d  ← 跨 session 不变
+Status:   active
+```
+
+**小明今天来上班领了工牌，明天再来领新工牌，但工牌号是一样的。**
+
+### 🛡️ 防刷分（INV-7）
+
+同一个 session 不能对同一个 trace 重复打分。防止小K给自己的差评刷好评。
+
+```bash
+$ aids rate tr_abc123 good "我觉得挺好的"
+Rated tr_abc123 as good
+$ aids rate tr_abc123 good "真的好"
+Error: already rated by this session (INV-7 duplicate rejection)
+```
+
+**但不同的人可以给同一个操作打分——小红的评价是小红的，小明的是小明的。**
+
+### 📊 统计面板（stats）
+
+一键看全局：
+
+```bash
+$ aids stats
+AIDS Statistics (2026-05-12 → 2026-05-18)
+
+Sessions: 108 total (active: 108)
+  By runtime: bash: 8, claude: 91, codex: 8, unknown: 1
+Traces:   1509 total (Write: 1, create: 20, execute: 989, modify: 113, read: 345, touch: 41)
+Resources touched: 983 unique
+Ratings: 3 total (good: 3)
+```
+
+### 🔍 万能查询（q）
+
+不用记命令，直接问：
+
+```bash
+$ aids q README.md              # 查文件的完整故事
+$ aids q tr_abc123              # 查某个 trace
+$ aids q agent-7f3a9c2e1d       # 按 agent_id 查
+```
 
 ---
 
@@ -148,7 +221,9 @@ AIDS 的核心就是三个东西：
 
 1. **Hook**：在 Claude Code / Codex / Bash 每次操作前后注入"看看有没有人刚动过"的逻辑
 2. **Timeline**：所有操作写入 `~/.aids/timeline/*.jsonl`，统一的操作链
-3. **Rating**：任何人可以给操作贴好评/差评，后来者能看到
+3. **Rating**：任何人可以给操作贴好评/差评，后来者能看到（同一人不能重复打分）
+
+完整命令列表：`aids {doctor, who-touched, timeline, rate, stats, q, op-chain, impact, export, commit-stamp}`
 
 零依赖。JSONL 文件。不阻塞操作。装了就生效。
 
