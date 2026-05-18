@@ -523,7 +523,8 @@ function appendTrace(record) {
 
 function getTraceById(traceId, options = {}) {
   if (!traceId) return null;
-  return readAllTraces(options).find((trace) => trace.traceId === traceId || trace.trace_id === traceId) || null;
+  const scanOpts = { days: 'all', ...options };
+  return readAllTraces(scanOpts).find((trace) => trace.traceId === traceId || trace.trace_id === traceId) || null;
 }
 
 function getTracesForFile(filePath, limit = Infinity, options = {}) {
@@ -546,7 +547,8 @@ function getRecentTraces(filePath, limit = 5, options = {}) {
 }
 
 function getTraceChain(traceId, options = {}) {
-  const all = readAllTraces(options);
+  const scanOpts = { days: 'all', ...options };
+  const all = readAllTraces(scanOpts);
   const byId = new Map(all.map((trace) => [trace.traceId, trace]));
   const chain = [];
   const seen = new Set();
@@ -569,7 +571,8 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === '--json' || arg === '-j') args.json = true;
     else if (arg === '--limit' || arg === '-n') args.limit = Number(argv[++i]);
-    else if (arg === '--days') args.days = argv[++i];
+    else if (arg === '--days' || arg === '-d') args.days = argv[++i];
+    else if (arg === '--all' || arg === '-a') args.days = 'all';
     else args._.push(arg);
   }
   return args;
@@ -600,7 +603,7 @@ function table(records) {
 }
 
 function usage() {
-  return `Usage:\n  node src/trace/trace.js recent <filePath> [--limit 5] [--days 30|all] [--json]\n  node src/trace/trace.js chain <traceId> [--days 30|all] [--json]\n  node src/trace/trace.js session <sessionId> [--days 30|all] [--json]\n`;
+  return `Usage:\n  node src/trace/trace.js recent <filePath> [--limit 5] [--days 30|all] [--all] [--json]\n  node src/trace/trace.js chain <traceId> [--days 30|all] [--all] [--json]\n  node src/trace/trace.js session <sessionId> [--days 30|all] [--all] [--json]\n`;
 }
 
 function main(argv = process.argv.slice(2)) {

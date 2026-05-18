@@ -21,10 +21,22 @@ function loadModules(home) {
   return { trace, ratings };
 }
 
+function utcDate(offsetDays = 0) {
+  const date = new Date();
+  date.setUTCHours(0, 0, 0, 0);
+  date.setUTCDate(date.getUTCDate() + offsetDays);
+  return date.toISOString().slice(0, 10);
+}
+
+function isoOnDate(date, second = 0) {
+  return `${date}T00:00:${String(second).padStart(2, '0')}.000Z`;
+}
+
 test('appendTrace stores chain and recent/session queries', () => {
   const home = tmpHome('trace');
   const { trace } = loadModules(home);
   const file = path.join(home, 'workspace', 'doc.md');
+  const today = utcDate();
 
   const first = trace.appendTrace({
     sessionId: 's1',
@@ -34,7 +46,7 @@ test('appendTrace stores chain and recent/session queries', () => {
     operation: 'Read',
     filePath: file,
     purpose: 'observe before editing',
-    timestamp: '2026-05-18T00:00:00.000Z',
+    timestamp: isoOnDate(today, 0),
   });
   const second = trace.appendTrace({
     sessionId: 's2',
@@ -43,7 +55,7 @@ test('appendTrace stores chain and recent/session queries', () => {
     operation: 'Write',
     filePath: file,
     purpose: 'write trace module',
-    timestamp: '2026-05-18T00:00:01.000Z',
+    timestamp: isoOnDate(today, 1),
   });
 
   assert.equal(second.prevTraceId, first.traceId);
@@ -52,8 +64,8 @@ test('appendTrace stores chain and recent/session queries', () => {
   assert.equal(trace.getRecentTraces(file, 1)[0].traceId, second.traceId);
   assert.deepEqual(trace.getTraceChain(second.traceId).map((item) => item.traceId), [first.traceId, second.traceId]);
   assert.deepEqual(trace.getSessionTraces('s2').map((item) => item.traceId), [second.traceId]);
-  assert.ok(fs.existsSync(path.join(home, 'traces', '2026-05-18.ndjson')));
-  const timeline = fs.readFileSync(path.join(home, 'timeline', '2026-05-18.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(fs.existsSync(path.join(home, 'traces', `${today}.ndjson`)));
+  const timeline = fs.readFileSync(path.join(home, 'timeline', `${today}.jsonl`), 'utf8').trim().split('\n').map(JSON.parse);
   assert.equal(timeline[0].schema_version, 'aids.timeline.v1');
   assert.equal(timeline[0].runtime, 'claude');
   assert.equal(timeline[0].actor_type, 'agent');
@@ -122,6 +134,7 @@ test('pre hook keeps injected context inside line budget', () => {
   const home = tmpHome('pre-hook-budget');
   const { trace } = loadModules(home);
   const file = path.join(home, 'shared.txt');
+  const today = utcDate();
   for (let i = 0; i < 4; i += 1) {
     trace.appendTrace({
       sessionId: `peer-${i}`,
@@ -129,7 +142,7 @@ test('pre hook keeps injected context inside line budget', () => {
       operation: 'Write',
       filePath: file,
       purpose: `very long purpose ${i} that should be clipped to protect context budget`,
-      timestamp: `2026-05-18T00:00:0${i}.000Z`,
+      timestamp: isoOnDate(today, i),
     });
   }
 
@@ -155,6 +168,56 @@ test('pre hook keeps injected context inside line budget', () => {
   const lines = result.stderr.trim().split(/\r?\n/);
   assert.ok(lines.length <= 5, result.stderr);
   assert.match(result.stderr, /context lines clipped/);
+});
+
+test('readAllTraces defaults to a 30-day scan window with explicit days override', () => {
+  const home = tmpHome('trace-days');
+  const { trace } = loadModules(home);
+  const recentFile = path.join(home, 'recent.txt');
+  const oldFile = path.join(home, 'old.txt');
+  const recent = trace.appendTrace({
+    sessionId: 'recent-session',
+    operation: 'Read',
+    filePath: recentFile,
+    purpose: 'recent trace',
+    timestamp: isoOnDate(utcDate(-1), 0),
+  });
+  const old = trace.appendTrace({
+    sessionId: 'old-session',
+    operation: 'Read',
+    filePath: oldFile,
+    purpose: 'old trace outside default window',
+    timestamp: isoOnDate(utcDate(-45), 0),
+  });
+
+  assert.deepEqual(trace.readAllTraces().map((item) => item.traceId), [recent.traceId]);
+  // getTraceById always scans all history (backward compat for lookups by ID)
+  assert.equal(trace.getTraceById(old.traceId).traceId, old.traceId);
+  assert.equal(trace.getTraceById(old.traceId, { days: 'all' }).traceId, old.traceId);
+
+  const defaultRecent = spawnSync(process.execPath, ['src/trace/trace.js', 'recent', oldFile, '--json'], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIDS_HOME: home },
+    encoding: 'utf8',
+  });
+  assert.equal(defaultRecent.status, 0, defaultRecent.stderr);
+  assert.deepEqual(JSON.parse(defaultRecent.stdout).traces, []);
+
+  const allRecent = spawnSync(process.execPath, ['src/trace/trace.js', 'recent', oldFile, '--days', 'all', '--json'], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIDS_HOME: home },
+    encoding: 'utf8',
+  });
+  assert.equal(allRecent.status, 0, allRecent.stderr);
+  assert.deepEqual(JSON.parse(allRecent.stdout).traces.map((item) => item.traceId), [old.traceId]);
+
+  const allFlagRecent = spawnSync(process.execPath, ['src/trace/trace.js', 'recent', oldFile, '--all', '--json'], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIDS_HOME: home },
+    encoding: 'utf8',
+  });
+  assert.equal(allFlagRecent.status, 0, allFlagRecent.stderr);
+  assert.deepEqual(JSON.parse(allFlagRecent.stdout).traces.map((item) => item.traceId), [old.traceId]);
 });
 
 test('ratings connect verdicts to trace summary and reputation', () => {
