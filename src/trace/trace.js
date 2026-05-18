@@ -45,6 +45,7 @@ const TRACE_OPERATIONS = new Set([
 const WRITE_OPERATIONS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'apply_patch', 'ApplyPatch']);
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 2500;
+const DEFAULT_TRACE_SCAN_DAYS = 30;
 
 function getStoreHome() {
   return path.resolve(
@@ -219,8 +220,52 @@ function allTraceFiles() {
     .map((name) => path.join(dir, name));
 }
 
-function readAllTraces() {
-  return allTraceFiles().flatMap(readNdjsonFile).sort(compareTraceTime);
+function parseTraceScanDays(value, fallback = DEFAULT_TRACE_SCAN_DAYS) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'string' && value.trim().toLowerCase() === 'all') return Infinity;
+  const days = Number(value);
+  if (!Number.isInteger(days) || days < 0) {
+    throw new Error(`days must be a non-negative integer or "all"; got ${value}`);
+  }
+  return days === 0 ? Infinity : days;
+}
+
+function traceFileDate(filePath) {
+  const match = path.basename(filePath).match(/^(\d{4})-(\d{2})-(\d{2})\.(?:ndjson|jsonl)$/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) {
+    return null;
+  }
+  return date;
+}
+
+function traceScanStartDate(days, now = new Date()) {
+  if (!Number.isFinite(days)) return null;
+  const date = now instanceof Date ? now : new Date(now);
+  if (Number.isNaN(date.getTime())) throw new Error(`invalid scan reference date: ${now}`);
+  const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  start.setUTCDate(start.getUTCDate() - (days - 1));
+  return start;
+}
+
+function filterTraceFilesByDays(files, days, now = new Date()) {
+  if (!Number.isFinite(days)) return files;
+  const startDate = traceScanStartDate(days, now);
+  return files.filter((filePath) => {
+    const fileDate = traceFileDate(filePath);
+    return fileDate && fileDate >= startDate;
+  });
+}
+
+function readAllTraces(options = {}) {
+  const scanOptions = options && typeof options === 'object' ? options : { days: options };
+  const days = parseTraceScanDays(scanOptions.days);
+  const files = filterTraceFilesByDays(allTraceFiles(), days, scanOptions.now);
+  return files.flatMap(readNdjsonFile).sort(compareTraceTime);
 }
 
 function compareTraceTime(a, b) {
@@ -476,32 +521,32 @@ function appendTrace(record) {
   return normalized;
 }
 
-function getTraceById(traceId) {
+function getTraceById(traceId, options = {}) {
   if (!traceId) return null;
-  return readAllTraces().find((trace) => trace.traceId === traceId || trace.trace_id === traceId) || null;
+  return readAllTraces(options).find((trace) => trace.traceId === traceId || trace.trace_id === traceId) || null;
 }
 
-function getTracesForFile(filePath, limit = Infinity) {
+function getTracesForFile(filePath, limit = Infinity, options = {}) {
   const normalizedPath = normalizeFilePath(filePath);
   const index = readIndex(normalizedPath);
   let traces;
   if (index && Array.isArray(index.traceIds) && index.traceIds.length) {
     const ids = new Set(index.traceIds);
-    traces = readAllTraces().filter((trace) => ids.has(trace.traceId));
+    traces = readAllTraces(options).filter((trace) => ids.has(trace.traceId));
   } else {
-    traces = readAllTraces().filter((trace) => trace.filePath === normalizedPath);
+    traces = readAllTraces(options).filter((trace) => trace.filePath === normalizedPath);
   }
   traces = traces.sort(compareTraceTime);
   if (Number.isFinite(limit)) return traces.slice(-limit);
   return traces;
 }
 
-function getRecentTraces(filePath, limit = 5) {
-  return getTracesForFile(filePath, limit).slice().reverse();
+function getRecentTraces(filePath, limit = 5, options = {}) {
+  return getTracesForFile(filePath, limit, options).slice().reverse();
 }
 
-function getTraceChain(traceId) {
-  const all = readAllTraces();
+function getTraceChain(traceId, options = {}) {
+  const all = readAllTraces(options);
   const byId = new Map(all.map((trace) => [trace.traceId, trace]));
   const chain = [];
   const seen = new Set();
@@ -514,16 +559,17 @@ function getTraceChain(traceId) {
   return chain.reverse();
 }
 
-function getSessionTraces(sessionId) {
-  return readAllTraces().filter((trace) => trace.sessionId === sessionId || trace.session_id === sessionId).sort(compareTraceTime);
+function getSessionTraces(sessionId, options = {}) {
+  return readAllTraces(options).filter((trace) => trace.sessionId === sessionId || trace.session_id === sessionId).sort(compareTraceTime);
 }
 
 function parseArgs(argv) {
-  const args = { _: [], json: false, limit: undefined };
+  const args = { _: [], json: false, limit: undefined, days: undefined };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--json' || arg === '-j') args.json = true;
     else if (arg === '--limit' || arg === '-n') args.limit = Number(argv[++i]);
+    else if (arg === '--days') args.days = argv[++i];
     else args._.push(arg);
   }
   return args;
@@ -554,31 +600,32 @@ function table(records) {
 }
 
 function usage() {
-  return `Usage:\n  node src/trace/trace.js recent <filePath> [--limit 5] [--json]\n  node src/trace/trace.js chain <traceId> [--json]\n  node src/trace/trace.js session <sessionId> [--json]\n`;
+  return `Usage:\n  node src/trace/trace.js recent <filePath> [--limit 5] [--days 30|all] [--json]\n  node src/trace/trace.js chain <traceId> [--days 30|all] [--json]\n  node src/trace/trace.js session <sessionId> [--days 30|all] [--json]\n`;
 }
 
 function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   const [cmd, value] = args._;
   const limit = Number.isFinite(args.limit) ? args.limit : 5;
+  const scanOptions = { days: args.days };
   try {
     if (cmd === 'recent') {
       if (!value) throw new Error('recent requires <filePath>');
-      const traces = getRecentTraces(value, limit);
+      const traces = getRecentTraces(value, limit, scanOptions);
       if (args.json) printJson({ filePath: normalizeFilePath(value), traces });
       else process.stdout.write(table(traces));
       return 0;
     }
     if (cmd === 'chain') {
       if (!value) throw new Error('chain requires <traceId>');
-      const traces = getTraceChain(value);
+      const traces = getTraceChain(value, scanOptions);
       if (args.json) printJson({ traceId: value, chain: traces });
       else process.stdout.write(table(traces));
       return traces.length ? 0 : 1;
     }
     if (cmd === 'session') {
       if (!value) throw new Error('session requires <sessionId>');
-      const traces = getSessionTraces(value);
+      const traces = getSessionTraces(value, scanOptions);
       if (args.json) printJson({ sessionId: value, traces });
       else process.stdout.write(table(traces));
       return traces.length ? 0 : 1;
