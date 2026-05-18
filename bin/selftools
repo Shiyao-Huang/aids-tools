@@ -1958,11 +1958,16 @@ def _export_date_range(args: argparse.Namespace) -> Tuple[Optional[str], Optiona
 
 
 def _record_date(record: Dict[str, Any]) -> Optional[str]:
-    """Best-effort YYYY-MM-DD date from a session or loose record."""
+    """Best-effort YYYY-MM-DD local date from a session or loose record."""
     for key in ("timestamp_iso", "started_iso", "last_seen_iso"):
         value = record.get(key)
         if isinstance(value, str) and len(value) >= 10:
             try:
+                # Parse full ISO timestamp and convert to local date
+                # (matches file naming convention which uses local today())
+                ts = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if ts.tzinfo is not None:
+                    return ts.astimezone().date().isoformat()
                 return _dt.date.fromisoformat(value[:10]).isoformat()
             except ValueError:
                 pass
@@ -1970,7 +1975,7 @@ def _record_date(record: Dict[str, Any]) -> Optional[str]:
         value = record.get(key)
         if isinstance(value, (int, float)):
             try:
-                return _dt.datetime.fromtimestamp(value / 1000.0, tz=_dt.timezone.utc).date().isoformat()
+                return _dt.datetime.fromtimestamp(value / 1000.0).date().isoformat()
             except (OverflowError, OSError, ValueError):
                 pass
     return None
