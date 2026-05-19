@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 
 function tmpHome(name) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `selftools-session-${name}-`));
@@ -15,6 +16,21 @@ function loadSession(home) {
   delete require.cache[require.resolve('../lib/constants')];
   delete require.cache[require.resolve('../lib/session')];
   return require('../lib/session');
+}
+
+function runSessionWorker(home, script) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, AIDS_HOME: home },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
 }
 
 // --- register ---
@@ -61,6 +77,36 @@ test('register defaults optional fields', () => {
   assert.equal(r.goal, '');
   assert.equal(r.runtime, 'claude');
   assert.equal(r.status, 'active');
+});
+
+test('register tolerates concurrent writes for the same session', async () => {
+  const home = tmpHome('concurrent-register');
+  const workers = Array.from({ length: 8 }, (_, i) => {
+    const payload = {
+      session_id: 'shared-session',
+      role: `role-${i}`,
+      display_name: `Agent ${i}`,
+      goal: 'x'.repeat(128 * 1024) + `-${i}`,
+      started_at: 1000 + i,
+    };
+    return runSessionWorker(
+      home,
+      `const session = require('./lib/session'); session.register(${JSON.stringify(payload)});`,
+    );
+  });
+
+  const results = await Promise.all(workers);
+  assert.deepEqual(results.map((result) => result.code), Array(8).fill(0), JSON.stringify(results, null, 2));
+
+  const session = loadSession(home);
+  const found = session.lookup('shared-session');
+  assert.ok(found);
+  assert.equal(found.session_id, 'shared-session');
+  assert.equal(found.status, 'active');
+  assert.match(found.role, /^role-\d$/);
+  assert.match(found.display_name, /^Agent \d$/);
+  assert.match(found.goal, /^x+-\d$/);
+  assert.ok(found.last_seen_at >= found.started_at);
 });
 
 // --- lookup ---
@@ -131,6 +177,27 @@ test('heartbeat bumps last_seen_at', () => {
   assert.ok(r2.last_seen_at >= before);
 });
 
+test('multiple heartbeats are monotonic and preserve session metadata', () => {
+  const home = tmpHome('heartbeat-multiple');
+  const session = loadSession(home);
+  const originalNow = Date.now;
+  let now = 2000;
+  Date.now = () => {
+    now += 10;
+    return now;
+  };
+  try {
+    session.register({ session_id: 's1', role: 'impl', goal: 'ship feature' });
+    const beats = [session.heartbeat('s1'), session.heartbeat('s1'), session.heartbeat('s1')];
+    assert.deepEqual(beats.map((beat) => beat.role), ['impl', 'impl', 'impl']);
+    assert.deepEqual(beats.map((beat) => beat.goal), ['ship feature', 'ship feature', 'ship feature']);
+    assert.ok(beats[0].last_seen_at < beats[1].last_seen_at);
+    assert.ok(beats[1].last_seen_at < beats[2].last_seen_at);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
 test('heartbeat returns null for missing', () => {
   const home = tmpHome('heartbeat-miss');
   const session = loadSession(home);
@@ -174,6 +241,16 @@ test('updateGoal partial update only changes provided fields', () => {
   const r = session.updateGoal('s1', { goal: 'updated' });
   assert.equal(r.task_id, 't0'); // unchanged
   assert.equal(r.goal, 'updated');
+});
+
+test('updateGoal accepts an explicit empty goal without clearing task_id', () => {
+  const home = tmpHome('goal-empty');
+  const session = loadSession(home);
+  session.register({ session_id: 's1', task_id: 't0', goal: 'original' });
+  const r = session.updateGoal('s1', { goal: '' });
+  assert.equal(r.task_id, 't0');
+  assert.equal(r.goal, '');
+  assert.equal(session.lookup('s1').goal, '');
 });
 
 // --- listActive ---

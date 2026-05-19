@@ -17,6 +17,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+const { StringDecoder } = require('string_decoder');
 
 const TRACE_OPERATIONS = new Set([
   'Write',
@@ -193,21 +194,42 @@ function appendLineAtomic(filePath, record) {
   });
 }
 
-function readNdjsonFile(filePath) {
+function parseNdjsonLine(line) {
+  if (!line || !line.trim()) return null;
+  try {
+    return normalizeTrace(JSON.parse(line));
+  } catch (_) {
+    return null;
+  }
+}
+
+function* streamNdjsonFile(filePath) {
   if (!fs.existsSync(filePath)) return [];
-  const text = fs.readFileSync(filePath, 'utf8');
-  if (!text.trim()) return [];
-  return text
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return normalizeTrace(JSON.parse(line));
-      } catch (_) {
-        return null;
+  const fd = fs.openSync(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const decoder = new StringDecoder('utf8');
+  let carry = '';
+  try {
+    while (true) {
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (!bytesRead) break;
+      const chunk = carry + decoder.write(buffer.subarray(0, bytesRead));
+      const lines = chunk.split(/\r?\n/);
+      carry = lines.pop() || '';
+      for (const line of lines) {
+        const record = parseNdjsonLine(line);
+        if (record) yield record;
       }
-    })
-    .filter(Boolean);
+    }
+    const finalRecord = parseNdjsonLine(carry + decoder.end());
+    if (finalRecord) yield finalRecord;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readNdjsonFile(filePath) {
+  return Array.from(streamNdjsonFile(filePath));
 }
 
 function allTraceFiles() {
@@ -265,7 +287,11 @@ function readAllTraces(options = {}) {
   const scanOptions = options && typeof options === 'object' ? options : { days: options };
   const days = parseTraceScanDays(scanOptions.days);
   const files = filterTraceFilesByDays(allTraceFiles(), days, scanOptions.now);
-  return files.flatMap(readNdjsonFile).sort(compareTraceTime);
+  const traces = [];
+  for (const filePath of files) {
+    for (const trace of streamNdjsonFile(filePath)) traces.push(trace);
+  }
+  return traces.sort(compareTraceTime);
 }
 
 function compareTraceTime(a, b) {

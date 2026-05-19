@@ -222,6 +222,31 @@ test('readAllTraces defaults to a 30-day scan window with explicit days override
   assert.deepEqual(JSON.parse(allFlagRecent.stdout).traces.map((item) => item.traceId), [old.traceId]);
 });
 
+test('readAllTraces parses trace files without slurping whole ndjson files', () => {
+  const home = tmpHome('trace-streaming');
+  const { trace } = loadModules(home);
+  const file = path.join(home, 'streamed.txt');
+  const appended = trace.appendTrace({
+    sessionId: 'stream-session',
+    operation: 'Read',
+    filePath: file,
+    purpose: 'stream parse trace file',
+  });
+
+  const originalReadFileSync = fs.readFileSync;
+  fs.readFileSync = function patchedReadFileSync(filePath, ...args) {
+    if (String(filePath).endsWith('.ndjson') || String(filePath).endsWith('.jsonl')) {
+      throw new Error('readAllTraces should not read entire trace files');
+    }
+    return originalReadFileSync.call(this, filePath, ...args);
+  };
+  try {
+    assert.deepEqual(trace.readAllTraces({ days: 'all' }).map((item) => item.traceId), [appended.traceId]);
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+  }
+});
+
 test('ratings connect verdicts to trace summary and reputation', () => {
   const home = tmpHome('ratings');
   const { trace, ratings } = loadModules(home);
