@@ -3993,7 +3993,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     checks.append(check("codex_hooks", file_contains(codex_hooks_json, "selftools") or file_contains(codex_hooks_json, "aids"), str(codex_hooks_json)))
     checks.append(check("codex_mcp", file_contains(codex_config, "mcp_servers.selftools") or file_contains(codex_config, "mcp_servers.aids"), str(codex_config)))
     # ── Hook scripts executable ──
-    for hook_name in ("selftools-session-start.sh", "selftools-pre-tool-use.sh", "selftools-post-tool-use.sh"):
+    for hook_name in ("_aid_common.sh", "selftools-session-start.sh", "selftools-pre-tool-use.sh", "selftools-post-tool-use.sh"):
         for home, label in ((claude_home, "claude"), (codex_home, "codex")):
             hp = home / "hooks" / hook_name
             ok_exec = hp.exists() and os.access(hp, os.X_OK)

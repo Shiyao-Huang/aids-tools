@@ -254,6 +254,7 @@ install_runtime_hooks() {
   local hook_dir="$runtime_home/hooks"
   info "Dropping $runtime_name hook scripts into $hook_dir"
   run mkdir -p "$hook_dir"
+  run install -m 755 "$INSTALL_DIR/hooks/_aid_common.sh" "$hook_dir/_aid_common.sh"
   run install -m 755 "$INSTALL_DIR/hooks/selftools-session-start.sh" "$hook_dir/selftools-session-start.sh"
   run install -m 755 "$INSTALL_DIR/hooks/selftools-pre-tool-use.sh" "$hook_dir/selftools-pre-tool-use.sh"
   run install -m 755 "$INSTALL_DIR/hooks/selftools-post-tool-use.sh" "$hook_dir/selftools-post-tool-use.sh"
@@ -503,8 +504,8 @@ uninstall_all() {
     claude mcp remove --scope user aids >/dev/null 2>&1 || true
     claude mcp remove --scope user selftools >/dev/null 2>&1 || true
   fi
-  run rm -f "$CLAUDE_HOME/hooks/selftools-session-start.sh" "$CLAUDE_HOME/hooks/selftools-pre-tool-use.sh" "$CLAUDE_HOME/hooks/selftools-post-tool-use.sh"
-  run rm -f "$CODEX_HOME/hooks/selftools-session-start.sh" "$CODEX_HOME/hooks/selftools-pre-tool-use.sh" "$CODEX_HOME/hooks/selftools-post-tool-use.sh"
+  run rm -f "$CLAUDE_HOME/hooks/_aid_common.sh" "$CLAUDE_HOME/hooks/selftools-session-start.sh" "$CLAUDE_HOME/hooks/selftools-pre-tool-use.sh" "$CLAUDE_HOME/hooks/selftools-post-tool-use.sh"
+  run rm -f "$CODEX_HOME/hooks/_aid_common.sh" "$CODEX_HOME/hooks/selftools-session-start.sh" "$CODEX_HOME/hooks/selftools-pre-tool-use.sh" "$CODEX_HOME/hooks/selftools-post-tool-use.sh"
   run rm -f "$BIN_DIR/selftools" "$BIN_DIR/aids" "$BIN_DIR/aid" "$BIN_DIR/selftools-mcp" "$BIN_DIR/aids-mcp" "$BIN_DIR/aid-mcp" "$BIN_DIR/claude-selftools" "$BIN_DIR/codex-selftools" "$BIN_DIR/aids-run" "$BIN_DIR/aids-bash" "$BIN_DIR/aid-run" "$BIN_DIR/aid-bash"
   # Remove identity artifacts from current directory and data dir
   for f in .identity AIDS_IDENTITY.md; do
