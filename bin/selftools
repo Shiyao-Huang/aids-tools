@@ -819,6 +819,7 @@ def update_index(resource: str, trace: Dict[str, Any], session: Dict[str, Any]) 
                 "last_intent": trace.get("intent"),
                 "last_seen_at": trace.get("timestamp"),
                 "last_chain_hash": trace.get("chain_hash"),
+                "last_trace_id": trace.get("trace_id"),
                 "timeline_path": str(data_dir() / "timeline" / f"{today()}.jsonl"),
                 "total_ops": int(idx.get("total_ops") or 0) + 1,
             }
@@ -847,18 +848,25 @@ def _append_trace_chain_atomic(
     idx_path = index_path(resource)
     idx_lock = lock_path_for(idx_path)
     with FileLock(idx_lock):
-        # 1. read previous chain hash from index
+        # 1. read previous chain state from index
         idx = read_json(idx_path, {}) or {}
         prev_chain_hash = idx.get("last_chain_hash")
+        trace_ids = list(idx.get("trace_ids") or [])
+        prev_trace_id = idx.get("last_trace_id") or (trace_ids[-1] if trace_ids else None)
 
-        # 2. compute new chain hash
+        # 2. compute new chain hash and persist explicit lineage.
+        # parent_trace_id may be supplied by nested tool wrappers; prev_trace_id is
+        # always the per-resource lineage used by op-chain and verification.
+        trace["prev_trace_id"] = prev_trace_id
+        if trace.get("parent_trace_id") is None:
+            trace["parent_trace_id"] = prev_trace_id
+        trace["parent_chain_hash"] = prev_chain_hash
         trace["chain_hash"] = _chain_hash_for_trace(trace, prev_chain_hash)
 
         # 3. append trace to JSONL
         append_jsonl(traces_file_for_today(), trace)
 
         # 4. update resource index (inline, still under same lock)
-        trace_ids = list(idx.get("trace_ids") or [])
         trace_ids.append(trace["trace_id"])
         trace_ids = trace_ids[-500:]
         idx.update(
@@ -874,6 +882,7 @@ def _append_trace_chain_atomic(
                 "last_intent": trace.get("intent"),
                 "last_seen_at": trace.get("timestamp"),
                 "last_chain_hash": trace["chain_hash"],
+                "last_trace_id": trace["trace_id"],
                 "timeline_path": str(data_dir() / "timeline" / f"{today()}.jsonl"),
                 "total_ops": int(idx.get("total_ops") or 0) + 1,
             }
@@ -1468,6 +1477,7 @@ def cmd_hook_post_tool_use(_: argparse.Namespace) -> int:
             "display_name": session.get("display_name"),
             "cwd": cwd,
             "tool_use_id": event.get("tool_use_id"),
+            "parent_trace_id": event.get("parent_trace_id") or event.get("parentTraceId"),
             "result": _extract_result(event),
             "model": session.get("model"),
             "metadata": {
@@ -3749,6 +3759,7 @@ def _verify_single_trace(target_trace_id: str, *, as_json: bool = False) -> int:
     target_resource = str(found.get("resource_path") or "")
     chain_state: Optional[str] = None
     candidates: List[Dict[str, Any]] = []
+    candidates_by_trace_id: Dict[str, Dict[str, Any]] = {}
     for tr in all_traces:
         if str(tr.get("resource_path") or "") != target_resource:
             continue
@@ -3757,16 +3768,27 @@ def _verify_single_trace(target_trace_id: str, *, as_json: bool = False) -> int:
         prior_hash = tr.get("chain_hash") or None
         chain_state = prior_hash
         if prior_hash:
-            candidates.append({"trace_id": tr.get("trace_id"), "chain_hash": prior_hash})
+            candidate = {"trace_id": tr.get("trace_id"), "chain_hash": prior_hash}
+            candidates.append(candidate)
+            candidates_by_trace_id[str(tr.get("trace_id"))] = candidate
         else:
             candidates = []
+            candidates_by_trace_id = {}
 
     stored_hash = found.get("chain_hash")
+    explicit_parent_hash = found.get("parent_chain_hash")
+    if explicit_parent_hash is None:
+        explicit_parent_id = found.get("prev_trace_id") or found.get("parent_trace_id")
+        if explicit_parent_id:
+            parent = candidates_by_trace_id.get(str(explicit_parent_id))
+            if parent:
+                explicit_parent_hash = parent.get("chain_hash")
+    verify_parent_hash = explicit_parent_hash if explicit_parent_hash is not None else chain_state
     if not stored_hash:
         result = {"trace_id": target_trace_id, "status": "legacy", "detail": "no chain_hash (legacy trace)"}
-    elif _signature_backend.verify(found, chain_state, stored_hash):
+    elif _signature_backend.verify(found, verify_parent_hash, stored_hash):
         result = {"trace_id": target_trace_id, "status": "valid", "detail": "chain hash verified"}
-    elif _find_chain_fork_parent(found, stored_hash, candidates):
+    elif explicit_parent_hash is None and _find_chain_fork_parent(found, stored_hash, candidates):
         result = {
             "trace_id": target_trace_id,
             "status": "forked",
@@ -3815,6 +3837,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     chain_state: Dict[str, Optional[str]] = {}
     # per-resource known chain states for legacy fork detection.
     chain_candidates: Dict[str, List[Dict[str, Any]]] = {}
+    chain_candidates_by_id: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     for jf in jsonl_files:
         try:
@@ -3837,14 +3860,23 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
             # ── Check 1: chain hash linkage ──
             if stored_chain_hash:
-                prev = chain_state.get(resource)
+                explicit_parent_hash = trace.get("parent_chain_hash")
+                if explicit_parent_hash is None:
+                    explicit_parent_id = trace.get("prev_trace_id") or trace.get("parent_trace_id")
+                    if explicit_parent_id:
+                        parent = chain_candidates_by_id.get(resource, {}).get(str(explicit_parent_id))
+                        if parent:
+                            explicit_parent_hash = parent.get("chain_hash")
+                prev = explicit_parent_hash if explicit_parent_hash is not None else chain_state.get(resource)
                 expected_hash = _chain_hash_for_trace(trace, prev)
                 if expected_hash != stored_chain_hash:
-                    parent = _find_chain_fork_parent(
-                        trace,
-                        stored_chain_hash,
-                        chain_candidates.get(resource, []),
-                    )
+                    parent = None
+                    if explicit_parent_hash is None:
+                        parent = _find_chain_fork_parent(
+                            trace,
+                            stored_chain_hash,
+                            chain_candidates.get(resource, []),
+                        )
                     if parent:
                         warnings.append({
                             "file": str(jf), "line": line_no,
@@ -3874,10 +3906,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
                     "file": str(jf),
                     "line": line_no,
                 })
+                if trace.get("trace_id"):
+                    chain_candidates_by_id.setdefault(resource, {})[str(trace.get("trace_id"))] = chain_candidates[resource][-1]
             else:
                 # No chain_hash field — legacy trace, skip chain check
                 chain_state[resource] = None
                 chain_candidates[resource] = []
+                chain_candidates_by_id[resource] = {}
                 ok_count += 1
 
             # ── Check 2: file hash consistency (pre_hash matches previous post_hash) ──

@@ -1654,6 +1654,90 @@ class TestCmdVerifyIntegration(TempDataMixin, unittest.TestCase):
         self.assertEqual(len(result["warnings"]), 1)
         self.assertEqual(result["warnings"][0]["parent_trace_id"], "tr_fork_base")
 
+    def test_verify_uses_explicit_parent_chain_hash_without_warning(self):
+        """New DAG-style traces verify against explicit parent_chain_hash."""
+        base = self._write_trace("tr_dag_base", "/tmp/dag.py", session_id="s1")
+        base_hash = selftools._chain_hash_for_trace(base, None)
+        linear = self._write_trace("tr_dag_linear", "/tmp/dag.py", session_id="s1")
+        linear_hash = selftools._chain_hash_for_trace(linear, base_hash)
+        forked = self._write_trace("tr_dag_branch", "/tmp/dag.py", session_id="s2")
+        forked_hash = selftools._chain_hash_for_trace(forked, base_hash)
+        self._rewrite_trace_records({
+            "tr_dag_base": {
+                "chain_hash": base_hash,
+                "prev_trace_id": None,
+                "parent_trace_id": None,
+                "parent_chain_hash": None,
+            },
+            "tr_dag_linear": {
+                "chain_hash": linear_hash,
+                "prev_trace_id": "tr_dag_base",
+                "parent_trace_id": "tr_dag_base",
+                "parent_chain_hash": base_hash,
+            },
+            "tr_dag_branch": {
+                "chain_hash": forked_hash,
+                "prev_trace_id": "tr_dag_base",
+                "parent_trace_id": "tr_dag_base",
+                "parent_chain_hash": base_hash,
+            },
+        })
+
+        args = selftools.build_parser().parse_args(["verify", "--json"])
+        import io
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = selftools.cmd_verify(args)
+        self.assertEqual(rc, 0, f"explicit parent chain should verify cleanly: {captured.getvalue()}")
+        result = json.loads(captured.getvalue())
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["warnings"], [])
+
+    def test_append_trace_chain_atomic_persists_explicit_lineage(self):
+        """New traces record prev_trace_id, parent_trace_id, and parent_chain_hash."""
+        session = {
+            "session_id": "lineage-s1",
+            "runtime": "codex",
+            "role": "implementer",
+            "actor_type": "agent",
+        }
+        resource = selftools.normalize_resource("/tmp/lineage-write.py")
+        base = {
+            "trace_id": "tr_lineage_base",
+            "session_id": "lineage-s1",
+            "tool": "Write",
+            "resource_path": resource,
+            "operation": "modify",
+            "timestamp": selftools.now_ms(),
+        }
+        child = {
+            "trace_id": "tr_lineage_child",
+            "session_id": "lineage-s1",
+            "tool": "Write",
+            "resource_path": resource,
+            "operation": "modify",
+            "parent_trace_id": None,
+            "timestamp": selftools.now_ms() + 1,
+        }
+        selftools._append_trace_chain_atomic(resource, base, session)
+        selftools._append_trace_chain_atomic(resource, child, session)
+
+        records = []
+        for line in selftools.traces_file_for_today().read_text(encoding="utf-8").splitlines():
+            records.append(json.loads(line))
+        by_id = {record["trace_id"]: record for record in records}
+        self.assertIsNone(by_id["tr_lineage_base"]["prev_trace_id"])
+        self.assertIsNone(by_id["tr_lineage_base"]["parent_trace_id"])
+        self.assertIsNone(by_id["tr_lineage_base"]["parent_chain_hash"])
+        self.assertEqual(by_id["tr_lineage_child"]["prev_trace_id"], "tr_lineage_base")
+        self.assertEqual(by_id["tr_lineage_child"]["parent_trace_id"], "tr_lineage_base")
+        self.assertEqual(by_id["tr_lineage_child"]["parent_chain_hash"], by_id["tr_lineage_base"]["chain_hash"])
+
+        idx = selftools.load_index(resource)
+        self.assertEqual(idx["last_trace_id"], "tr_lineage_child")
+        self.assertEqual(idx["last_chain_hash"], by_id["tr_lineage_child"]["chain_hash"])
+
     def test_verify_specific_trace_id(self):
         """aids verify <trace_id> verifies only that trace."""
         trace = self._write_trace("tr_specific", "/tmp/specific.py")

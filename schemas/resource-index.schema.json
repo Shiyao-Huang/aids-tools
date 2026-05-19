@@ -48,6 +48,18 @@
         "null"
       ]
     },
+    "last_trace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_chain_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "last_writer": {
       "type": [
         "string",

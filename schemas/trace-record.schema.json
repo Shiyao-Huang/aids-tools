@@ -111,6 +111,18 @@
         "null"
       ]
     },
+    "prev_trace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent_chain_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "result": {
       "type": [
         "object",
