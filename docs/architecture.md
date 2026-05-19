@@ -22,18 +22,22 @@ graph TB
     subgraph CLIs["Agent Runtimes"]
         CC["Claude Code\n(claude CLI)"]
         CX["Codex\n(codex CLI)"]
+        SH["Bash\n(aid-bash / aids-bash)"]
     end
 
     subgraph HookLayer["Hook Chain Layer"]
         direction TB
-        PRE["PreToolUse Hook\npre_tool_use.sh"]
-        POST["PostToolUse Hook\npost_tool_use.sh"]
+        SS["SessionStart\nselftools-session-start.sh"]
+        PRE["PreToolUse\npre_tool_use.sh → pre_tool_use.js"]
+        POST["PostToolUse\npost_tool_use.sh → post_tool_use.js"]
+        COMMON["Shared Helpers\n_aid_shared.js + _aid_common.sh"]
     end
 
     subgraph ToolLayer["Native Tool Layer"]
         W["Write"]
         R["Read"]
         E["Edit"]
+        ME["MultiEdit / apply_patch"]
         B["Bash"]
     end
 
@@ -43,7 +47,7 @@ graph TB
         TS["Trace Store\n~/.aids/traces/"]
         TL["Timeline\n~/.aids/timeline/"]
         RL["Rating Layer\n~/.aids/ratings/"]
-        IDX["Resource Index\n~/.aids/index/"]
+        IDX["Resource Index\n~/.aids/index/\nlast 1000 ids + metadata"]
         CG["Code Graph\n~/.aids/codegraph/"]
         LK["File Locks\n~/.aids/locks/"]
         PD["Pending Ops\n~/.aids/pending/"]
@@ -62,14 +66,20 @@ graph TB
 
     CC -->|"tool call JSON"| PRE
     CX -->|"tool call JSON"| PRE
+    SH -->|"wrapped command"| PRE
+    CC -->|"session.start"| SS
+    CX -->|"session.start"| SS
+    SH -->|"session registration"| SS
+    SS -->|"registers/updates"| SR
+    PRE --> COMMON
+    POST --> COMMON
     PRE -->|"injects trace context\ninto tool call"| ToolLayer
     ToolLayer -->|"tool result"| POST
     POST -->|"records operation"| TS
+    POST -->|"appends timeline event"| TL
     POST -->|"updates index"| IDX
     PRE -->|"reads last N ops"| IDX
     PRE -->|"resolves session"| SR
-    CC -->|"session.start"| SR
-    CX -->|"session.start"| SR
     RL -->|"annotates"| TS
     QueryAPI -->|"reads"| Core
     IDX -->|"fast path lookup"| TS
@@ -95,16 +105,18 @@ sequenceDiagram
     participant POST as PostToolUse Hook
 
     A->>PRE: {session_id, tool, input}
-    PRE->>SR: resolve(session_id) → {role, goal, task_id}
-    PRE->>IDX: last_ops(resource_path, limit=5)
+    PRE->>SR: resolve(session_id) → {role, goal, task_id, runtime, actor_type}
+    Note over PRE: Resolve resource keys<br/>file paths or bash:{hash}
+    PRE->>IDX: last_ops(resource_key, limit=5)
     IDX-->>PRE: [TraceRecord...]
     Note over PRE: Build context injection:<br/>"Last writer: Jane@scribe<br/>Goal: document API<br/>2m ago"
     PRE-->>A: inject context into tool env
     A->>TOOL: execute(tool_call)
     TOOL-->>POST: {result, exit_code, duration_ms}
-    POST->>TS: write(TraceRecord)
-    POST->>IDX: update(resource_path, trace_id)
-    POST-->>A: {result + trace_id}
+    Note over POST: Extract result summary<br/>status/is_error/exit_code
+    POST->>TS: write TraceRecord(s)
+    POST->>IDX: update(resource_key, trace_id)
+    POST-->>A: stderr summary with tool/resource + agent_id
     Note over A: Agent now aware of<br/>trace_id for this op
 ```
 
@@ -137,14 +149,18 @@ graph LR
 ```mermaid
 graph TB
     subgraph TraceStore["Trace Store (~/.aids/traces/YYYY-MM-DD.jsonl)"]
-        T1["trace_001: Write docs/arch.md\n  by: architect/abc123\n  intent: design doc\n  pre_hash: null\n  post_hash: a3f9..."]
-        T2["trace_002: Read docs/arch.md\n  by: scribe/def456\n  intent: document AIM\n  pre_hash: a3f9..."]
-        T3["trace_003: Edit docs/arch.md\n  by: scribe/def456\n  intent: add data model\n  pre_hash: a3f9...\n  post_hash: b7c2..."]
+        T1["trace_001: Write docs/arch.md\n  actor: agent/claude\n  agent_id: agent-a1b2\n  intent: design doc"]
+        T2["trace_002: Read docs/arch.md\n  actor: agent/codex\n  result: {status, exit_code}"]
+        T3["trace_003: Bash cat docs/arch.md\n  resource: docs/arch.md\n  runtime: bash"]
     end
 
     subgraph Index["Resource Index (~/.aids/index/)"]
-        I1["docs/arch.md → [001, 002, 003]"]
-        I2["aids/hooks/pre.sh → [004, 005]"]
+        I1["docs/arch.md\ntraceIds: [001, 002, 003]\ntraces: compact metadata\nlastWriter / lastRuntime"]
+        I2["bash:{command_hash}\ntraceIds: [004, 005]"]
+    end
+
+    subgraph Timeline["Timeline (~/.aids/timeline/YYYY-MM-DD.jsonl)"]
+        TL1["append-only audit event\nmirrors normalized trace"]
     end
 
     subgraph RatingLayer["Rating Layer (~/.aids/ratings/)"]
@@ -153,8 +169,11 @@ graph TB
     end
 
     TraceStore -->|"indexed by resource"| Index
+    TraceStore -->|"mirrored as events"| Timeline
     RatingLayer -->|"annotates"| TraceStore
 ```
+
+`readAllTraces()` defaults to a bounded recent-history scan (30 days) so normal queries do not load unlimited trace history. Chain lookup APIs that must preserve backward compatibility (`getTraceById()` and `getTraceChain()`) opt into `days: "all"` so old traces remain discoverable.
 
 ---
 
@@ -183,9 +202,14 @@ graph TB
         CSH["~/.local/bin/codex-shim\nwraps native codex binary\ninjects AIDS_SESSION_ID"]
     end
 
+    subgraph BashWrap["Bash Integration"]
+        BW["aid-bash / aids-bash\nrecords shell reads + writes"]
+    end
+
     CURL --> S1 --> S2 --> S3 --> S4 --> S5 --> S6
     S3 --> ClaudeHook
     S4 --> CodexShim
+    S2 --> BashWrap
 
     style Install fill:#0f3460,color:#eee
     style ClaudeHook fill:#1a1a2e,color:#eee
@@ -234,7 +258,7 @@ graph LR
 ├── timeline/
 │   └── YYYY-MM-DD.jsonl          # Timeline events (batch writes)
 ├── index/
-│   └── {base64_path}.json        # [trace_id...] per resource
+│   └── {base64_path}.json        # traceIds + compact trace metadata per resource
 ├── ratings/
 │   └── YYYY-MM-DD.jsonl          # RatingRecord (append-only, INV-7 dedup)
 ├── codegraph/
@@ -261,17 +285,28 @@ aids-tools/                       # This project (implementation; current checko
 │   ├── rating-record.schema.json
 │   └── resource-index.schema.json
 ├── hooks/
-│   ├── pre_tool_use.sh           # PreToolUse hook
-│   └── post_tool_use.sh          # PostToolUse hook
+│   ├── pre_tool_use.sh           # Shell entrypoint for PreToolUse
+│   ├── pre_tool_use.js           # Context injection + risk surfacing
+│   ├── post_tool_use.sh          # Shell entrypoint for PostToolUse
+│   ├── post_tool_use.js          # Trace append + index/timeline update
+│   ├── selftools-session-start.sh # SessionStart identity registration
+│   ├── _aid_shared.js            # Shared JS hook helpers
+│   └── _aid_common.sh            # Shared shell hook helpers
 ├── bin/
-│   ├── aids-session               # Session register/lookup CLI
-│   ├── aids-trace                 # Trace query CLI
-│   └── aids-rate                  # Rating CLI
+│   ├── selftools                 # Python compatibility CLI
+│   └── selftools-mcp             # MCP server entrypoint
 ├── lib/
 │   ├── session.js                # SessionRecord CRUD
-│   ├── trace.js                  # TraceRecord writer/reader
-│   ├── index.js                  # Resource index
-│   └── rating.js                 # Rating CRUD
+│   ├── trace.js                  # Legacy/simple TraceRecord API
+│   ├── index.js                  # Legacy/simple resource index API
+│   └── constants.js              # AIDS_HOME + env aliases
+├── src/
+│   ├── trace/trace.js            # Canonical JS trace/index/timeline implementation
+│   ├── registry/registry.js      # Registry CLI/API
+│   └── ratings/ratings.js        # Rating store + normalization
+├── wrappers/
+│   ├── aid-bash / aids-bash      # Bash runtime wrappers
+│   └── aid-run / aids-run        # Generic command wrappers
 ├── install.sh                    # One-liner installer
 └── README.md
 ```
@@ -283,23 +318,25 @@ aids-tools/                       # This project (implementation; current checko
 | Decision | Choice | Rationale |
 |---|---|---|
 | Trace storage | Append-only JSONL | Zero deps, grep-able, survives crashes |
-| Resource index | Per-file JSON array | O(1) lookup, fits in RAM |
+| Resource index | Per-resource JSON object capped to recent 1000 trace IDs + metadata | Fast awareness lookup without unbounded index growth |
 | Hook delivery (Claude) | settings.json preToolUse/postToolUse | Official API, survives upgrades |
 | Hook delivery (Codex) | PATH shim wrapper | No native hook API yet |
+| Hook delivery (Bash) | `aid-bash` / `aids-bash` wrappers | Lets human shell reads/writes participate in the same trace graph |
 | Session identity | ENV var `AIDS_SESSION_ID` | Available to hooks without file I/O |
 | Intent capture | From `AIDS_INTENT` ENV or task comment | Declared, not inferred |
 | Rating storage | Separate JSONL from traces | Ratings arrive after the fact |
 | Install surface | `~/.aids/` global | Cross-project awareness |
-| Tool coverage | Write + Read + Edit + Bash | All four native tools intercepted |
+| Tool coverage | Write + Read + Edit + MultiEdit + apply_patch + Bash | File and shell operations share one trace model |
 | Plugin pattern | settings.json hooks (Claude) + PATH shim (Codex) | Like superpower / claude-for-codex |
 | Schema versioning | `selftools.hook.v1` | Machine-checkable contract for all runtimes |
-| Code graph | Built-in AST analysis + cached JSON | Zero deps, replaces external GitNexus |
+| Code graph | Built-in AST analysis + cached JSON, plus optional GitNexus index for contributor navigation | Local `aids impact` works without network; GitNexus adds cross-symbol/process context during development |
 | Hash chain | SHA256(prev_hash + trace fields) | Tamper-proof, self-verifying |
 | Protected config | Immutable keys (signature, hash_chain) | Agents cannot disable security features |
+| Trace scans | Default 30-day window; explicit `"all"` for chain/back-compat APIs | Prevents normal query OOM while preserving historical lookup semantics |
 
 ---
 
-## New Modules
+## Current Implementation Modules
 
 ### Session-Start Identity Inference
 
@@ -307,9 +344,9 @@ On `SessionStart` hook, AIDS automatically infers agent identity from a cascade 
 
 ```
 session_id ← AIDS_SESSION_ID → AID_SESSION_ID → SESSION_ID → AHA_SESSION_ID
-role       ← AIDS_ROLE → AHA_AGENT_ROLE → ROLE
-runtime    ← AIDS_RUNTIME or detected from transcript_path (.claude / .codex)
-display    ← AIDS_DISPLAY_NAME → AHA_SESSION_NAME
+role       ← AIDS_ROLE → AID_ROLE → AHA_AGENT_ROLE → ROLE
+runtime    ← AIDS_RUNTIME → AID_RUNTIME → SELFTOOLS_RUNTIME → ZHUYI_RUNTIME
+display    ← AIDS_SESSION_NAME → AHA_SESSION_NAME
 goal       ← AIDS_INTENT → AHA_INTENT → AHA_AGENT_SCOPE_SUMMARY
 ```
 
@@ -336,14 +373,26 @@ Hooks output a dual-format JSON for cross-runtime compatibility:
 
 Supported events: `SessionStart`, `PreToolUse`, `PostToolUse`.
 
+### Shared Hook Helpers
+
+The hook layer intentionally keeps runtime-specific entrypoints small:
+
+- `hooks/_aid_shared.js` owns `inferRuntime()`, `inferActorType()`, `resolveAgentId()`, `extractResourceKeys()`, `extractBashResources()`, and context-budget helpers.
+- `hooks/_aid_common.sh` owns shell-side runtime/identity/bin lookup used by `*.sh` wrappers.
+- `hooks/post_tool_use.js` writes one trace per extracted resource key. Bash commands can therefore produce file-resource traces instead of only a coarse command-string trace.
+
+This avoids the duplicated JS and shell identity/resource parsing that earlier Legion reviews flagged.
+
 ### Code Graph (Built-in Impact Analysis)
 
-AIDS includes a built-in code graph analyzer that replaces external GitNexus:
+AIDS includes a built-in code graph analyzer for local impact checks:
 
 - **AST parsing**: Python and JS/TS files are parsed to extract imports, exports, and references
 - **Cached graphs**: Stored in `~/.aids/codegraph/{root_hash}.json`, auto-refreshed on file changes
 - **Impact query**: `aids impact <path>` shows dependents, dependencies, importance, and risk
 - **Hook integration**: PreToolUse automatically shows code graph importance for write operations
+
+For contributor workflows this repository is also indexed by GitNexus (`aids-tools`), which is used for symbol/process impact analysis before code edits.
 
 ### Hash Chain
 
@@ -355,12 +404,15 @@ GENESIS → tr_a1b2 (chain_hash: a3f8...) → tr_a1b3 (chain_hash: 7e2c...) → 
 
 Tamper with any entry, and all subsequent hashes break. Verify with `aids verify`.
 
+In the Python CLI path, trace append, `chain_hash` computation, and resource-index update happen under one resource-index lock so concurrent writers cannot read the same `last_chain_hash` and create an accidental fork.
+
 ### File Locks
 
 Cross-platform file locks with stale detection:
 
 - Stored in `~/.aids/locks/`
-- PID-based stale detection (5-minute timeout)
+- PID/dead-holder stale detection plus a default 30-second lock TTL
+- 5-minute mtime cleanup for abandoned lock files
 - `fcntl.flock` on Unix, `os.rename()` atomic fallback on Windows
 - Path traversal prevention (locks must live under `~/.aids/locks/`)
 
@@ -368,22 +420,6 @@ Cross-platform file locks with stale detection:
 
 - **`aids stats`**: Aggregate dashboard — sessions by runtime, trace counts by operation, unique resources, ratings
 - **`aids export`**: Export traces as JSONL, CSV, or JSON for external analysis
-
-## Key Design Decisions (Legacy)
-
-| Decision | Choice | Rationale |
-|---|---|---|
-| Trace storage | Append-only JSONL | Zero deps, grep-able, survives crashes |
-| Resource index | Per-file JSON array | O(1) lookup, fits in RAM |
-| Hook delivery (Claude) | settings.json preToolUse/postToolUse | Official API, survives upgrades |
-| Hook delivery (Codex) | PATH shim wrapper | No native hook API yet |
-| Session identity | ENV var `AIDS_SESSION_ID` | Available to hooks without file I/O |
-| Intent capture | From `AIDS_INTENT` ENV or task comment | Declared, not inferred |
-| Rating storage | Separate JSONL from traces | Ratings arrive after the fact |
-| Install surface | `~/.aids/` global | Cross-project awareness |
-| Tool coverage | Write + Read + Edit + Bash | All four native tools intercepted |
-| Plugin pattern | settings.json hooks (Claude) + PATH shim (Codex) | Like superpower / claude-for-codex |
-| Schema versioning | `selftools.hook.v1` | Machine-checkable contract for all runtimes |
 
 ---
 
