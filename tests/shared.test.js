@@ -197,6 +197,39 @@ test('extractBashResources detects known extensionless filenames', () => {
   assert.ok(keys.some(k => k.includes('Makefile')));
 });
 
+test('extractBashResources ignores heredoc body while keeping redirect target', () => {
+  const keys = extractBashResources("cat <<'EOF' > /tmp/heredoc.txt\ncat /tmp/body.txt\nEOF");
+  assert.ok(keys.includes('/tmp/heredoc.txt'));
+  assert.ok(!keys.some(k => k.includes('body.txt')));
+  const pathKeys = keys.filter(k => !k.startsWith('bash:'));
+  assert.equal(new Set(pathKeys).size, pathKeys.length);
+});
+
+test('extractBashResources trims process substitution read targets', () => {
+  const keys = extractBashResources('diff <(sort /tmp/proc-a.txt) <(sort /tmp/proc-b.txt)');
+  assert.ok(keys.includes('/tmp/proc-a.txt'));
+  assert.ok(keys.includes('/tmp/proc-b.txt'));
+  assert.ok(!keys.some(k => k.endsWith('proc-a.txt)')));
+  assert.ok(!keys.some(k => k.endsWith('proc-b.txt)')));
+});
+
+test('extractBashResources detects xargs read targets from pipeline input', () => {
+  const keys = extractBashResources('printf "%s\\n" /tmp/xargs-input.txt | xargs cat');
+  assert.ok(keys.includes('/tmp/xargs-input.txt'));
+});
+
+test('extractBashResources detects find -exec search roots without glob false positives', () => {
+  const keys = extractBashResources('find /tmp/project -name "*.js" -exec grep TODO {} \\;');
+  assert.ok(keys.includes('/tmp/project'));
+  assert.ok(!keys.some(k => k.includes('*.js')));
+});
+
+test('extractBashResources handles inline env vars used in command paths', () => {
+  const keys = extractBashResources('AIDS_TEST_DIR=/tmp/aids-env cat "$AIDS_TEST_DIR/input.txt"');
+  assert.ok(keys.includes('/tmp/aids-env/input.txt'));
+  assert.ok(!keys.some(k => k.includes('AIDS_TEST_DIR=')));
+});
+
 // --- budgetInt ---
 
 test('budgetInt returns fallback when no env', () => {
